@@ -1,0 +1,45 @@
+# Git
+.git/
+.gitignore
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Virtual env
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data (mounted as volumes, not copied into image)
+data/bronze/
+data/silver/
+data/gold/
+
+# Docs (heavy PDFs, not needed at runtime)
+Docs/CCTs/
+
+# Temp files
+*.bak
+tmp_*.py
+tmp_names.txt
+
+# Sensitive
+.env
+*.env.local
+credentials.json

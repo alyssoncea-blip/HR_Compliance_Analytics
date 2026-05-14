@@ -1,0 +1,511 @@
+# Projeto Completo de Portfólio — Plataforma de Auditoria Trabalhista Inteligente com Engenharia de Dados, Governança e IA
+
+Quero desenvolver um projeto de portfólio de nível profissional focado em
+
+ Engenharia de Dados
+ Governança de Dados
+ Data Quality
+ People Analytics
+ Reconciliação de Dados
+ Auditoria Trabalhista
+ Integração de Sistemas
+ Arquitetura Moderna de Dados
+ Analytics aplicado ao RH
+
+O projeto será inspirado em um problema real enfrentado em ambiente corporativo
+a validação cruzada de dados trabalhistas entre múltiplas fontes para identificar inconsistências de pagamento, divergências de jornada, descumprimento de convenções coletivas e riscos trabalhistas.
+
+---
+
+# CONTEXTO DO PROBLEMA
+
+Empresas normalmente possuem diversos sistemas separados
+
+ sistema de folha,
+ sistema de ponto,
+ ERP,
+ sistema financeiro,
+ HRIS,
+ APIs corporativas,
+ exportações CSV,
+ bancos relacionais,
+ integrações entre fornecedores diferentes.
+
+Na prática
+
+ os layouts mudam,
+ os sistemas variam por cliente,
+ existem inconsistências,
+ as regras mudam conforme sindicato e convenção coletiva,
+ e o RH possui dificuldade em validar se os pagamentos realmente estão corretos.
+
+O objetivo do projeto é simular exatamente esse cenário corporativo.
+
+---
+
+# IMPORTANTE — DADOS REAIS vs DADOS SIMULADOS
+
+Este é um projeto de portfólio.
+
+Portanto
+
+## Dados que serão SIMULADOS
+
+Como não possuo acesso a dados reais corporativos, os seguintes datasets precisarão ser gerados sinteticamente
+
+### 1. Dados de Folha de Pagamento
+
+Simular
+
+ APIs,
+ respostas JSON,
+ exportações,
+ tabelas relacionais,
+ múltiplos layouts,
+ múltiplos clientes.
+
+Os dados devem conter
+
+ funcionário,
+ cargo,
+ salário,
+ admissão,
+ demissão,
+ promoção,
+ centro de custo,
+ sindicato,
+ eventos da folha,
+ INSS,
+ FGTS,
+ IRRF,
+ benefícios,
+ banco de horas,
+ adicionais,
+ dependentes,
+ salário-família,
+ férias,
+ afastamentos,
+ verbas trabalhistas.
+
+---
+
+### 2. Dados de Cartão de Ponto
+
+Simular
+
+ marcações,
+ jornadas,
+ escalas,
+ atrasos,
+ faltas,
+ banco de horas,
+ adicional noturno,
+ horas extras,
+ trabalho em finais de semana,
+ inconsistências.
+
+Os dados devem simular
+
+ múltiplos fornecedores,
+ múltiplos layouts,
+ múltiplos clientes,
+ múltiplos tipos de jornada.
+
+---
+
+### 3. Dados Financeiros  Comprovantes de Pagamento
+
+Simular
+
+ comprovantes,
+ holerites,
+ pagamentos,
+ créditos bancários,
+ transferências,
+ divergências financeiras.
+
+Criar cenários como
+
+ pagamento incorreto,
+ pagamento parcial,
+ folha correta mas pagamento divergente,
+ horas extras não pagas,
+ evento lançado mas não pago,
+ comprovante incompatível com folha.
+
+---
+
+## ÚNICA FONTE REAL — CONVENÇÃO COLETIVA (CCT)
+
+A única fonte real do projeto será a Convenção Coletiva.
+
+Quero buscar CCTs/ACTs reais na internet para
+
+ interpretar regras,
+ validar cálculos,
+ analisar mudanças históricas,
+ comparar sindicatos,
+ aplicar regras trabalhistas reais.
+
+Utilizar
+
+ múltiplos sindicatos,
+ múltiplos estados,
+ múltiplos anos,
+ múltiplas versões históricas,
+ diferenças entre empresa pública e privada,
+ diferenças regionais.
+
+---
+
+### SETOR ESCOLHIDO: SANEAMENTO BÁSICO (ÁGUA E ESGOTO)
+
+Setor com forte variação regional — cada estado possui sindicato próprio, convenções diferentes, e empresas distintas (estatais, privadas, mistas). Ideal para demonstrar reconciliação de dados entre múltiplas fontes com regras divergentes.
+
+### CCTs/ACTs SELECIONADAS (3 ESTADOS + COMPLEMENTAR)
+
+#### 1. MINAS GERAIS — Sindágua MG / Copasa (Estatal)
+
+ Sindicato: SINDÁGUA-MG (Sindicato dos Trabalhadores nas Indústrias de Purificação e Distribuição de Água e em Serviços de Esgotos de MG)
+ Empresa: COPASA (Companhia de Saneamento de Minas Gerais)
+ ACTs disponíveis: 2019/2022, 2022/2023, 2023/2024, 2024/2025, 2025/2027
+ Jornada: 44h semanais (padrão)
+ Adicional noturno: conforme CLT
+ Horas extras: 50% seg-sáb, 100% domingos e feriados
+ Periculosidade: 30%
+ Insalubridade: conforme laudo
+ Reajuste ACT 2024: 4,62% + INPC
+
+#### 2. RIO DE JANEIRO — Sindágua RJ / Múltiplas Concessionárias (Misto)
+
+ Sindicato: SINDÁGUA-RJ (Sindicato dos Trabalhadores nas Indústrias da Purificação e Distribuição de Água e em Serviços de Esgotos de Niterói e Região)
+ Empresas com ACTs disponíveis:
+   - Águas do Rio (privada): ACTs 2021/2023, 2023/2024, 2024/2025, 2025/2026
+   - Águas de Niterói (privada): ACTs 2014-2026 (série histórica completa)
+   - Cedae (estatal): ACTs 2010-2024 (série histórica completa)
+   - Águas de Nova Friburgo, Prolagos, SAAL, etc.
+ Jornada: 44h (administrativo) / escalas operacionais
+ Diferenciais: Múltiplas concessionárias no mesmo estado com ACTs próprios — permite comparar regras entre empresas diferentes na mesma base sindical
+
+#### 3. RIO GRANDE DO NORTE — Sindágua RN / CAERN (Estatal — Jornada Diferenciada)
+
+ Sindicato: SINDÁGUA-RN
+ Empresa: CAERN (Companhia de Águas e Esgotos do Rio Grande do Norte)
+ ACTs disponíveis: 2024/2025
+ Diferencial CRÍTICO: Jornada reduzida de 30h semanais (administrativo) e escala 3x3 (operacional) — diferente dos demais estados
+ Reajuste ACT 2024: 12,70% (INPC + ganho real)
+ Adicional noturno: conforme CLT + regras próprias
+ Benefícios: Prêmio Aposentadoria, Licença Prêmio, Auxílio Educação
+
+#### 4. COMPLEMENTAR — OUTROS ESTADOS (REFERÊNCIA)
+
+ SP (Sintaema): Sabesp (estatal) e LF Gestão (privada) — ACT 2025/2026, adicional insalubridade 40% sobre o piso, periculosidade 30%, banco de horas 44h/mês, PLR
+ ES (Sindaema): Cesan — ACT 2025/2026, adicional insalubridade 40%, PLR própria, estabilidade gestante ampliada
+ MS (Sindágua-MS): Sanesul / Águas Guariroba — ACT 2025/2027, contexto de privatização
+
+---
+
+### REGRAS EXTRAÍDAS PARA VALIDAÇÃO (POR ESTADO)
+
+| Regra | MG (Copasa) | RJ (Águas do Rio) | RN (CAERN) |
+|---|---|---|---|
+| Jornada semanal | 44h | 44h | 30h (adm) / 3x3 (op) |
+| Hora extra seg-sáb | 50% | 50% | 50% |
+| Hora extra dom/feriado | 100% | 100% | 100% |
+| Adicional noturno | 20% (CLT) | 20% (CLT) | 20% (CLT) |
+| Periculosidade | 30% | 30% | 30% |
+| Insalubridade | Conforme laudo | Conforme laudo | Conforme laudo |
+| Banco de horas | — | — | — |
+| Piso salarial (referência) | ACT específico | ACT específico | ACT específico |
+| Reajuste (ano base) | 4,62% (2024) | Negociação própria | 12,70% (2024) |
+
+### MUDANÇAS HISTÓRICAS A CAPTURAR
+
+ Para cada estado, capturar ACTs de múltiplos anos para demonstrar evolução de:
+
+ Reajustes salariais (INPC vs ganho real)
+ Benefícios (VA/VR, cesta básica, auxílio creche)
+ Regras de jornada
+ Cláusulas sociais (assédio, diversidade, igualdade salarial)
+ Contribuições sindicais
+
+---
+
+# OBJETIVO PRINCIPAL DO SISTEMA
+
+O sistema deverá
+
+1. Integrar múltiplas fontes de dados
+2. Padronizar layouts diferentes
+3. Modelar os dados trabalhistas
+4. Validar regras da CCT
+5. Cruzar dados entre folha, ponto e pagamentos
+6. Detectar inconsistências automaticamente
+7. Gerar indicadores analíticos
+8. Gerar alertas de risco trabalhista
+9. Apoiar auditoria e governança de RH
+
+---
+
+# O QUE O SISTEMA PRECISA VALIDAR
+
+O sistema deve responder perguntas como
+
+ O funcionário recebeu corretamente
+ As horas extras seguem a CCT
+ O adicional noturno foi pago corretamente
+ Existe pagamento sem evento correspondente
+ O valor pago bate com a folha
+ O ponto bate com a jornada contratada
+ Existem divergências por sindicato
+ Existem funcionários com risco trabalhista
+ Houve descumprimento de convenção coletiva
+ Existem inconsistências críticas no fechamento da folha
+
+---
+
+# CENÁRIOS QUE DEVEM SER GERADOS
+
+Quero cenários
+
+ corretos,
+ incorretos,
+ ambíguos,
+ incompletos,
+ e históricos.
+
+Exemplos
+
+## Horas Extras
+
+ 50%
+ 70%
+ 100%
+ hora extra não paga
+ hora extra paga incorretamente
+ percentual divergente da CCT
+
+## Adicional Noturno
+
+ cálculo correto
+ cálculo incorreto
+ ausência de adicional
+
+## Banco de Horas
+
+ saldo positivo
+ saldo negativo
+ limite excedido
+
+## Escalas
+
+ 5x2
+ 6x1
+ 12x36
+
+## Divergências
+
+ CPF inconsistente
+ cargo incompatível
+ funcionário inexistente
+ pagamento sem folha
+ folha sem comprovante
+ ponto sem pagamento
+
+---
+
+# ARQUITETURA DO PROJETO
+
+Quero uma arquitetura moderna de Engenharia de Dados.
+
+## Camadas
+
+ Bronze
+ Silver
+ Gold
+
+---
+
+# TECNOLOGIAS ENVOLVIDAS
+
+## Engenharia de Dados
+
+ Python
+ SQL
+ PySpark
+ Delta Lake
+ Databricks (preferencial)
+ GCP  AWS  Azure
+
+## Transformação e Modelagem
+
+ dbt (opcional)
+ DuckDB (opcional)
+
+## Integração
+
+ APIs REST simuladas
+ JSON
+ CSV
+ Parquet
+
+## Governança
+
+ Data Catalog
+ Dicionário de Dados
+ Linhagem
+ Regras de Qualidade
+ Auditoria
+ Logs
+ Monitoramento
+
+## IA  NLP
+
+ interpretação de CCT,
+ classificação de regras,
+ extração de entidades,
+ detecção de padrões,
+ identificação de inconsistências.
+
+---
+
+# MODELAGEM DE DADOS
+
+Quero modelagem
+
+ relacional,
+ analítica,
+ temporal.
+
+Entidades
+
+ funcionário,
+ sindicato,
+ cargo,
+ jornada,
+ folha,
+ ponto,
+ pagamento,
+ eventos,
+ CCT,
+ inconsistências.
+
+Quero
+
+ tabelas fato,
+ dimensões,
+ histórico temporal,
+ versionamento de regras.
+
+---
+
+# DATA QUALITY E GOVERNANÇA
+
+O projeto deve demonstrar
+
+ Data Stewardship,
+ Governança,
+ Data Quality,
+ Reconciliação,
+ Compliance,
+ rastreabilidade,
+ integridade,
+ consistência,
+ completude,
+ unicidade.
+
+---
+
+# PIPELINES
+
+Quero pipelines para
+
+ ingestão,
+ transformação,
+ padronização,
+ enriquecimento,
+ reconciliação,
+ validação,
+ geração de alertas,
+ analytics.
+
+---
+
+# DASHBOARDS FINAIS (FOCO RH E AUDITORIA)
+
+No final do projeto quero construir dashboards profissionais voltados para RH, Auditoria e People Analytics.
+
+Os dashboards devem mostrar
+
+## Indicadores Operacionais
+
+ total de funcionários,
+ total de pagamentos,
+ total de divergências,
+ percentual de inconsistência,
+ inconsistências por cliente,
+ inconsistências por sindicato,
+ inconsistências por período.
+
+---
+
+## Indicadores Trabalhistas
+
+ horas extras incorretas,
+ adicional noturno divergente,
+ banco de horas inválido,
+ pagamentos não realizados,
+ divergências de jornada,
+ descumprimento de CCT.
+
+---
+
+## Indicadores Financeiros
+
+ impacto financeiro das inconsistências,
+ valor potencial de passivo trabalhista,
+ ranking de maior risco,
+ perdas estimadas.
+
+---
+
+## Indicadores de Governança
+
+ qualidade dos dados,
+ completude,
+ integridade,
+ rastreabilidade,
+ origem das inconsistências.
+
+---
+
+# OBJETIVO FINAL
+
+O projeto deve parecer um sistema corporativo real de auditoria trabalhista e governança de RH.
+
+Quero que ele demonstre capacidade em
+
+ Engenharia de Dados,
+ Data Governance,
+ Data Quality,
+ Analytics,
+ Modelagem,
+ Integração,
+ People Analytics,
+ Arquitetura Moderna,
+ Reconciliação de Dados,
+ Regras Trabalhistas,
+ Auditoria,
+ e geração de insights para RH.
+
+O objetivo é criar um projeto extremamente forte para
+
+ portfólio,
+ LinkedIn,
+ entrevistas técnicas,
+ vagas de Data Engineer,
+ Analytics Engineer,
+ Data Steward,
+ Data Quality,
+ People Analytics,
+ Governança de Dados.

@@ -1,0 +1,49 @@
+# HR Compliance Analytics — Docker Compose
+#
+# Quick start:
+#   docker compose up -d          # launch dashboards (auto-generates data if missing)
+#   docker compose run app pipeline  # run full data pipeline
+#   docker compose run app test      # run test suite
+#   docker compose down              # stop everything
+#
+# Access: http://localhost:8050
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hr-compliance-analytics
+    image: hr-compliance-analytics:latest
+    ports:
+      - "8050:8050"
+    volumes:
+      # Persist generated data outside container
+      - ./data:/app/data
+      # Keep tests accessible
+      - ./tests:/app/tests
+    environment:
+      - PYTHONUNBUFFERED=1
+      - DASH_HOST=0.0.0.0
+      - DASH_PORT=8050
+      - DASH_DEBUG_MODE=false
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8050/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    command: ["app"]
+
+  # Optional: run pipeline once and exit
+  pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hr-compliance-analytics:latest
+    profiles: ["tools"]
+    volumes:
+      - ./data:/app/data
+    entrypoint: ["python"]
+    command: ["-c", "from pipelines.ingest.main import main; main()"]

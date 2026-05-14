@@ -1,0 +1,10 @@
+# HR Compliance Analytics — Dependencies
+dash==4.1.0
+dash-bootstrap-components==2.0.4
+plotly==5.24.1
+pandas>=2.0
+duckdb>=0.10
+pyarrow>=14.0
+
+# Dev / Test
+pytest>=7.0
