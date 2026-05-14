@@ -6,16 +6,33 @@
 
 ## Dashboard Preview — Pré-visualização dos Dashboards
 
-| | |
-|:---:|:---:|
-| ![Dashboard Estratégico](Docs/Dashboards/01_dashboard_estrategico.png) | ![Dashboard Analítico](Docs/Dashboards/02_dashboard_analitico.png) |
-| **01 — Estratégico** | **02 — Analítico** |
-| ![Dashboard Auditoria](Docs/Dashboards/03_dashboard_auditoria_funcionario.png) | ![Dashboard Reconciliação](Docs/Dashboards/04_dashboard_reconciliacao.jpeg) |
-| **03 — Auditoria Individual** | **04 — Reconciliação & Compliance** |
-| ![Dashboard People Analytics](Docs/Dashboards/05_dashboard_people_analytics.png) | ![Dashboard IA / NLP](Docs/Dashboards/06_dashboard_ia_nlp.jpeg) |
-| **05 — People Analytics** | **06 — IA & NLP** |
-| ![Dashboard Governança](Docs/Dashboards/07_dashboard_governanca.png) | |
-| **07 — Governança & Data Quality** | |
+**01 — Estratégico**
+
+![Dashboard Estratégico](Docs/Dashboards/01_dashboard_estrategico.png)
+
+**02 — Analítico**
+
+![Dashboard Analítico](Docs/Dashboards/02_dashboard_analitico.png)
+
+**03 — Auditoria Individual**
+
+![Dashboard Auditoria](Docs/Dashboards/03_dashboard_auditoria_funcionario.png)
+
+**04 — Reconciliação & Compliance**
+
+![Dashboard Reconciliação](Docs/Dashboards/04_dashboard_reconciliacao.jpeg)
+
+**05 — People Analytics**
+
+![Dashboard People Analytics](Docs/Dashboards/05_dashboard_people_analytics.png)
+
+**06 — IA & NLP**
+
+![Dashboard IA / NLP](Docs/Dashboards/06_dashboard_ia_nlp.jpeg)
+
+**07 — Governança & Data Quality**
+
+![Dashboard Governança](Docs/Dashboards/07_dashboard_governanca.png)
 
 ---
 
