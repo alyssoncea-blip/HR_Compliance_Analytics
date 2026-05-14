@@ -25,7 +25,10 @@ def write_pq(name, sql):
     print(f"  {name:30s} {rows:>10,} rows  {size_mb:>8.1f} MB")
 
 def lineage_columns(source):
-    return f"'{source}' AS source_file, TIMESTAMP '{NOW_ISO}' AS ingested_at"
+    return f"'{source}' AS source_file, TIMESTAMP '{NOW_ISO}' AS ingested_at, CAST(HASH(CAST(c AS VARCHAR)) AS VARCHAR) AS source_hash"
+
+def lineage_columns_generated(source):
+    return f"'{source}' AS source_file, TIMESTAMP '{NOW_ISO}' AS ingested_at, CAST(HASH(CAST(d AS VARCHAR)) AS VARCHAR) AS source_hash"
 
 print("=" * 60)
 print("BRONZE -> SILVER PIPELINE")
@@ -57,7 +60,7 @@ SELECT CAST(STRFTIME(d, '%Y%m%d') AS INT) AS date_sk, d AS full_date,
        WHEN EXTRACT(MONTH FROM d) IN (4,5,6) THEN 2
        WHEN EXTRACT(MONTH FROM d) IN (7,8,9) THEN 3 ELSE 4 END AS quarter,
   CAST(STRFTIME(d, '%u') AS INT) IN (6,7) AS is_weekend,
-  {lineage_columns('auto_generated')}
+  {lineage_columns_generated('auto_generated')}
 FROM dates
 """)
 

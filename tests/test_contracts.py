@@ -12,7 +12,7 @@ def test_gold_contract_tables_exist_and_non_empty():
     ]
     for path in required:
         cnt = con.execute(f"SELECT COUNT(*) FROM read_parquet('{path}')").fetchone()[0]
-        assert cnt >= 0
+        assert cnt > 0, f"{path} should not be empty"
 
 
 def test_cct_rules_have_temporal_coverage():
@@ -26,6 +26,24 @@ def test_cct_rules_have_temporal_coverage():
     ).fetchdf()
     assert set(df["state"]) == {"MG", "RJ", "RN"}
     assert (df["versions"] >= 3).all()
+
+
+def test_cct_rules_do_not_overlap_within_state():
+    con = duckdb.connect()
+    overlap = con.execute(
+        """
+        WITH r AS (
+            SELECT state, valid_from, valid_to,
+                   LEAD(valid_from) OVER (PARTITION BY state ORDER BY valid_from) AS next_valid_from
+            FROM read_parquet('data/gold/dim_cct_rule_version.parquet')
+        )
+        SELECT COUNT(*)
+        FROM r
+        WHERE next_valid_from IS NOT NULL
+          AND valid_to >= next_valid_from
+        """
+    ).fetchone()[0]
+    assert overlap == 0, f"Found {overlap} overlapping CCT validity windows"
 
 
 def test_passivo_is_derived_from_detected_inconsistencies():
@@ -54,3 +72,11 @@ def test_monthly_contract_columns_are_populated():
     assert row[0] is not None
     assert row[1] is not None
     assert row[2] is not None
+
+
+def test_silver_tables_have_source_hash_lineage_column():
+    con = duckdb.connect()
+    cols = con.execute(
+        "DESCRIBE SELECT * FROM read_parquet('data/silver/dim_employee.parquet')"
+    ).fetchdf()["column_name"].tolist()
+    assert "source_hash" in cols

@@ -388,7 +388,7 @@ COL_DESCRIPTIONS = {
     "financial_impact": "Impacto financeiro estimado em Reais",
     "source_file": "Arquivo de origem no Bronze layer",
     "ingested_at": "Timestamp de ingestao",
-    "source_hash": "Hash MD5 da linha para deteccao de mudancas",
+    "source_hash": "Hash deterministico da linha para rastreabilidade e deteccao de mudancas",
     "periculosidade_eligible": "Cargo elegivel ao adicional de periculosidade",
     "insalubridade_eligible": "Cargo elegivel ao adicional de insalubridade",
 }

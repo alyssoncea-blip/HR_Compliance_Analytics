@@ -413,20 +413,15 @@ print(f"  -> {len(res)} detected ({time.time()-t0:.1f}s)")
 # =========================================================================
 print("[UC17] CPF Divergente...")
 t0 = time.time()
-# Note: we can detect this from the __divergent_cpf injection markers
-# Since CPF divergence is a cross-system issue, it's pre-injected
 q = f"""
-    SELECT e.employee_id, 'N/A' AS competence, 17 AS use_case,
+    SELECT i.employee_id, 'N/A' AS competence, 17 AS use_case,
            'CPF divergente entre sistemas' AS rule_name, 'cadastro' AS category, 'medio' AS severity,
            'CPF divergente' AS detected_value,
-           'CPF consistente' AS expected_value,
-           0.0 AS financial_impact,
-           'CPF do sistema financeiro difere do RH — reconciliacao impedida' AS detail
-    FROM read_parquet({pq("dim_employee")}) e
-    WHERE e.cpf IS NOT NULL AND LENGTH(e.cpf) = 11
-    -- 2% employees flagged with divergent CPF (UC17 injection created ~200 records)
-    -- Use a hash-based sampling to match the injection rate
-    AND ABS(HASH(e.employee_id)) % 100 < 2
+            'CPF consistente' AS expected_value,
+            0.0 AS financial_impact,
+            'CPF do sistema financeiro difere do RH — reconciliacao impedida' AS detail
+    FROM read_parquet({bq("audit/inconsistency_log")}) i
+    WHERE i.use_case = 17
 """
 res = con.execute(q).fetchdf()
 detections.append(res)
@@ -767,11 +762,16 @@ import pandas as pd
 all_detections = pd.concat(detections, ignore_index=True)
 all_detections["detected_at"] = NOW_ISO
 all_detections["detection_id"] = range(1, len(all_detections) + 1)
+all_detections["rule_origin"] = "rule_engine"
+all_detections["evidence_source"] = "computed_from_cross_source"
+sim_mask = all_detections["use_case"].isin([17])
+all_detections.loc[sim_mask, "rule_origin"] = "simulation_marker"
+all_detections.loc[sim_mask, "evidence_source"] = "bronze.audit.inconsistency_log"
 
 # Reorder columns
 cols = ["detection_id", "employee_id", "competence", "use_case", "rule_name",
-        "category", "severity", "detected_value", "expected_value",
-        "financial_impact", "detail", "detected_at"]
+         "category", "severity", "detected_value", "expected_value",
+        "financial_impact", "detail", "rule_origin", "evidence_source", "detected_at"]
 all_detections = all_detections[cols]
 
 # Write to Gold Parquet

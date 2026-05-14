@@ -358,18 +358,27 @@ def observability_status():
 
 def orfaos():
     return query(f"""
-        SELECT f.employee_id, count(*) AS registros_sem_ponto
+        WITH ponto_mensal AS (
+            SELECT
+                employee_id,
+                CAST(STRFTIME(CAST(full_date AS DATE), '%Y') AS INTEGER) AS year,
+                CAST(STRFTIME(CAST(full_date AS DATE), '%m') AS INTEGER) AS month,
+                COUNT(*) AS qtd_registros_ponto
+            FROM read_parquet({pq('fact_time_record')})
+            GROUP BY employee_id, year, month
+        )
+        SELECT f.employee_id, count(*) AS competencias_sem_ponto
         FROM read_parquet({pq('fact_payroll')}) f
         JOIN read_parquet({pq('dim_employee')}) e ON f.employee_id = e.employee_id
         JOIN read_parquet({pq('dim_unit')}) u ON e.unit_id = u.unit_id
         JOIN read_parquet({pq('dim_union')}) un ON e.union_id = un.union_id
-        LEFT JOIN read_parquet({pq('fact_time_record')}) t
-            ON f.employee_id=t.employee_id AND f.date_sk=t.date_sk
-        WHERE t.record_id IS NULL
+        LEFT JOIN ponto_mensal t
+            ON f.employee_id=t.employee_id AND f.year=t.year AND f.month=t.month
+        WHERE COALESCE(t.qtd_registros_ponto, 0) = 0
           {"AND u.state = '" + _GLOBAL_FILTERS['estado'] + "'" if _GLOBAL_FILTERS.get('estado') else ""}
           {"AND u.name = '" + _GLOBAL_FILTERS['unidade'] + "'" if _GLOBAL_FILTERS.get('unidade') else ""}
           {"AND un.name = '" + _GLOBAL_FILTERS['sindicato'] + "'" if _GLOBAL_FILTERS.get('sindicato') else ""}
-        GROUP BY f.employee_id ORDER BY registros_sem_ponto DESC LIMIT 20
+        GROUP BY f.employee_id ORDER BY competencias_sem_ponto DESC LIMIT 20
     """)
 
 # ---------------------------------------------------------------------------

@@ -99,7 +99,7 @@ A arquitetura de engenharia de dados foi projetada para simular um ambiente corp
 - Cálculo automático de impacto financeiro por inconsistência detectada
 
 **Governança (`pipelines/governance.py`)**
-- 48 verificações automáticas de qualidade (completude, unicidade, integridade referencial, consistência, validade)
+- 53 verificações automáticas de qualidade (completude, unicidade, integridade referencial, consistência, validade)
 - Data catalog em JSON com 5.618 linhas de metadados
 - Manifesto de lineage e auditoria de pipeline
 
@@ -153,7 +153,7 @@ HR Compliance Analytics/
 │   ├── bronze_to_silver.py       # Curadoria e padronização
 │   ├── silver_to_gold.py         # Modelagem dimensional
 │   ├── validation_engine.py      # 32 regras de validação trabalhista
-│   └── governance.py             # 48 checks de data quality
+│   └── governance.py             # 53 checks de data quality
 │
 ├── data/                         # Camadas Medallion
 │   ├── bronze/                   # CSVs brutos e schemas
@@ -445,7 +445,7 @@ A interface foi intencionalmente projetada para parecer uma **plataforma corpora
           ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                      GOLD (pipelines/silver_to_gold)                    │
-│   Star Schema: 7 facts + 5 dims + SCD2 + pré-agregações analíticas      │
+│   Star Schema: fatos principais + dimensões + SCD2 + pré-agregações      │
 └─────────────────────────────────────────────────────────────────────────┘
           │
           ▼
@@ -457,7 +457,7 @@ A interface foi intencionalmente projetada para parecer uma **plataforma corpora
           ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │              GOVERNANÇA (pipelines/governance)                          │
-│              48 checks de qualidade + catalog + lineage                 │
+│              53 checks de qualidade + catalog + lineage                 │
 └─────────────────────────────────────────────────────────────────────────┘
           │
           ▼
@@ -642,7 +642,7 @@ The data engineering architecture was designed to simulate a real corporate envi
 - Automatic financial impact calculation per detected inconsistency
 
 **Governance (`pipelines/governance.py`)**
-- 48 automated quality checks (completeness, uniqueness, referential integrity, consistency, validity)
+- 53 automated quality checks (completeness, uniqueness, referential integrity, consistency, validity)
 - JSON data catalog with 5,618 lines of metadata
 - Lineage manifest and pipeline audit trail
 
@@ -672,7 +672,7 @@ Silver is where cleaning, standardization, and enrichment occur. Types are corre
 ### Gold — Business-Ready Analytical Layer
 The Gold layer contains business models ready for analytical consumption and dashboards.
 
-- **Star Schema:** 7 fact tables + 5 dimensions + SCD2
+- **Star Schema:** core fact tables + dimensions + SCD2
 - **Facts:** payroll, time-clock, financial payments, hour bank, detected inconsistencies, labor liability, people movement
 - **Dimensions:** employee (SCD2), unit, position, union, date
 - **Pre-aggregations:** monthly totals by unit, risk ranking, liability evolution, compliance by union
@@ -696,7 +696,7 @@ HR Compliance Analytics/
 │   ├── bronze_to_silver.py       # Curation and standardization
 │   ├── silver_to_gold.py         # Dimensional modeling
 │   ├── validation_engine.py      # 32 labor validation rules
-│   └── governance.py             # 48 data quality checks
+│   └── governance.py             # 53 data quality checks
 │
 ├── data/                         # Medallion layers
 │   ├── bronze/                   # Raw CSVs and schemas
@@ -988,7 +988,7 @@ The interface was intentionally designed to look like a **corporate risk monitor
           ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                      GOLD (pipelines/silver_to_gold)                    │
-│   Star Schema: 7 facts + 5 dims + SCD2 + analytical pre-aggregations    │
+│   Star Schema: core facts + dimensions + SCD2 + analytical pre-aggregations │
 └─────────────────────────────────────────────────────────────────────────┘
           │
           ▼
@@ -1000,7 +1000,7 @@ The interface was intentionally designed to look like a **corporate risk monitor
           ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │              GOVERNANCE (pipelines/governance)                          │
-│              48 quality checks + catalog + lineage                      │
+│              53 quality checks + catalog + lineage                      │
 └─────────────────────────────────────────────────────────────────────────┘
           │
           ▼
