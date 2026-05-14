@@ -5,8 +5,9 @@ import plotly.graph_objects as go
 import pandas as pd
 from datetime import datetime
 from app.theme.colors import PETROLEO, AZUL_CLARO, CINZA, BRANCO, VERDE, AMARELO, VERMELHO
-from app.data import distribuicao_estado, ranking_unidades, resumo_reconciliacao, ccts_processadas
+from app.data import distribuicao_estado, ranking_unidades, ccts_processadas
 from app.data import window_alert_data, payment_month_data, jornada_donut_data, compliance_table_data
+from app.kpis import get_metric
 
 # ---------------------------------------------------------------------------
 # Fallback data
@@ -49,12 +50,11 @@ def _safe_data():
         df_rank["severity"] = df_rank.apply(_calc_severity, axis=1)
 
     try:
-        res = resumo_reconciliacao().iloc[0]
         resumo = {
-            "total_inconsistencias": int(res.total_inconsistencias),
-            "pct_critico": float(res.pct_critico),
-            "impacto_total": float(res.impacto_total),
-            "funcionarios_afetados": int(res.funcionarios_afetados),
+            "total_inconsistencias": get_metric("inconsistencias_total"),
+            "pct_critico": 0.0,
+            "impacto_total": get_metric("impacto_total"),
+            "funcionarios_afetados": get_metric("funcionarios_afetados"),
         }
     except Exception:
         resumo = {

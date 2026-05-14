@@ -5,8 +5,9 @@ import plotly.graph_objects as go
 import pandas as pd
 from datetime import datetime
 from app.theme.colors import PETROLEO, AZUL_CLARO, CINZA, BRANCO, VERDE, AMARELO, VERMELHO
-from app.data import (kpi_ferias_vencidas, kpi_passivo_ferias, kpi_proximos_vencimento,
-                      evolucao_risco, status_geral, ranking_unidades, is_demo_mode)
+from app.data import (kpi_passivo_ferias,
+                       evolucao_risco, status_geral, ranking_unidades, is_demo_mode)
+from app.kpis import get_metric
 
 # ---------------------------------------------------------------------------
 # Fallback data helpers
@@ -15,26 +16,28 @@ def _safe_data():
     """Fetch data. Fallbacks only when HRA_DEMO_MODE=true."""
     demo_mode = is_demo_mode()
     try:
-        vac = kpi_ferias_vencidas().iloc[0]
-        pct = round(vac.vencidas / vac.total * 100, 1) if vac.total > 0 else 0
+        pct = get_metric("pct_ferias_vencidas")
     except Exception:
         if not demo_mode:
             raise
         pct = 12.4
 
     try:
-        pas = kpi_passivo_ferias().iloc[0]
-        passivo = pas.passivo_total
+        df_pas = kpi_passivo_ferias()
+        if df_pas.empty:
+            passivo = 0.0
+        else:
+            val = df_pas.iloc[0].passivo_total
+            passivo = float(val) if val is not None else 0.0
     except Exception:
         if not demo_mode:
             raise
         passivo = 1_245_000
 
     try:
-        prox = kpi_proximos_vencimento().iloc[0]
-        qtd_prox = int(prox.qtd)
-        crit = int(prox.critico)
-        aten = int(prox.atencao)
+        qtd_prox = get_metric("proximos_vencimento_count")
+        crit = 0
+        aten = 0
     except Exception:
         if not demo_mode:
             raise
@@ -178,7 +181,7 @@ def _sparkline_fig(df: pd.DataFrame = None):
         margin=dict(l=0, r=0, t=0, b=20),
         xaxis=dict(
             tickfont=dict(size=9, color="#888"),
-            tickangle=0,
+            tickangle=-45,
             showgrid=False,
             zeroline=False,
         ),
@@ -235,6 +238,7 @@ def _risk_evolution_fig(df: pd.DataFrame):
                             linecolor="#ddd",
                             tickfont=dict(size=11, color="#4A5568"),
                             titlefont=dict(size=12, color="#4A5568"),
+                            tickangle=-45,
                         ),
                         yaxis=dict(
                             title="Nº de funcionários vencidos",

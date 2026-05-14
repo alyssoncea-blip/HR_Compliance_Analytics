@@ -2,6 +2,7 @@ import duckdb
 import pandas as pd
 from pathlib import Path
 import os
+from functools import lru_cache
 
 ROOT = Path(__file__).resolve().parent.parent
 SILVER = ROOT / "data" / "silver"
@@ -12,8 +13,13 @@ _con = None
 _GLOBAL_FILTERS = {"start_date": None, "end_date": None, "estado": None, "unidade": None, "sindicato": None}
 
 
+def clear_query_cache():
+    query.cache_clear()
+
+
 def set_global_filters(filters: dict | None):
     global _GLOBAL_FILTERS
+    clear_query_cache()
     if not filters:
         _GLOBAL_FILTERS = {"start_date": None, "end_date": None, "estado": None, "unidade": None, "sindicato": None}
         return
@@ -67,6 +73,7 @@ def get_con():
 def pq(path): return ("'" + str((SILVER / f"{path}.parquet").as_posix()) + "'").replace("//", "/")
 def gq(path): return ("'" + str((GOLD / f"{path}.parquet").as_posix()) + "'").replace("//", "/")
 
+@lru_cache(maxsize=256)
 def query(sql: str) -> pd.DataFrame:
     return get_con().execute(sql).fetchdf()
 

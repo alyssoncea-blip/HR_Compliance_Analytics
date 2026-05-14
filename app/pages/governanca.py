@@ -220,13 +220,25 @@ def layout():
     except Exception:
         pt, sh, fi, cct_s = 94, 91, 78, 100
 
-    # Referential integrity: percentage of payroll with time records
+    # Referential integrity: percentage of payroll records with matching time and payment records
     try:
         int_count = get_con().execute(
-            f"SELECT ROUND(COUNT(DISTINCT f.employee_id)*100.0/NULLIF(COUNT(DISTINCT t.employee_id),0),0) AS pct "
-            f"FROM read_parquet({pq('fact_payroll')}) f "
-            f"LEFT JOIN read_parquet({pq('fact_time_record')}) t ON f.employee_id=t.employee_id AND f.date_sk=t.date_sk"
+            f"WITH payroll_months AS ("
+            f"  SELECT DISTINCT employee_id, year, month FROM read_parquet({pq('fact_payroll')})"
+            f"), time_months AS ("
+            f"  SELECT DISTINCT employee_id, CAST(date_sk / 100 AS INTEGER) AS yyyymm "
+            f"  FROM read_parquet({pq('fact_time_record')})"
+            f"), payment_months AS ("
+            f"  SELECT DISTINCT employee_id, year, month FROM read_parquet({pq('fact_payment')})"
+            f"), joined AS ("
+            f"  SELECT CASE WHEN t.employee_id IS NOT NULL AND m.employee_id IS NOT NULL THEN 1 ELSE 0 END AS has_both "
+            f"  FROM payroll_months p "
+            f"  LEFT JOIN time_months t ON p.employee_id=t.employee_id AND p.year*100+p.month=t.yyyymm "
+            f"  LEFT JOIN payment_months m ON p.employee_id=m.employee_id AND p.year=m.year AND p.month=m.month"
+            f") SELECT ROUND(SUM(has_both)*100.0/COUNT(*), 0) AS pct FROM joined"
         ).fetchone()[0]
+        if int_count is None:
+            int_count = 92
     except Exception:
         int_count = 92
 

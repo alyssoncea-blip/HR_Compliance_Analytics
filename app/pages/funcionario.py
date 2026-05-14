@@ -5,15 +5,16 @@ import plotly.graph_objects as go
 import pandas as pd
 from datetime import datetime
 from app.theme.colors import PETROLEO, AZUL_CLARO, CINZA, BRANCO, VERDE, AMARELO, VERMELHO
-from app.data import (headcount, piramide_salarial, faixa_etaria,
-                      turnover_anual, equidade_salarial,
-                      movimentacao_mensal_12m, saude_organizacional)
+from app.data import (piramide_salarial, faixa_etaria,
+                       movimentacao_mensal_12m, saude_organizacional)
+from app.kpis import get_metric
 
 # ---------------------------------------------------------------------------
 # Fallback / mock data
 # ---------------------------------------------------------------------------
 def _safe_headcount():
     try:
+        from app.data import headcount
         hc = headcount().iloc[0]
         return {
             "total": int(hc.total) if hasattr(hc, "total") else 4280,
@@ -56,20 +57,14 @@ def _safe_piramide():
 
 def _safe_turnover():
     try:
-        df = turnover_anual()
-        if df.empty:
-            raise ValueError("empty")
-        return float(df.iloc[0].taxa)
+        return get_metric("turnover_pct")
     except Exception:
         return 8.4
 
 
 def _safe_equidade():
     try:
-        df = equidade_salarial()
-        if df.empty:
-            raise ValueError("empty")
-        return float(df.iloc[0].razao)
+        return get_metric("equidade_salarial")
     except Exception:
         return 0.94
 

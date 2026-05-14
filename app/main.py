@@ -327,11 +327,8 @@ def render_page(pathname, date_filter, estado, unidade, sindicato):
         "unidade": unidade,
         "sindicato": sindicato,
     }
-    try:
-        from app.data import set_global_filters
-        set_global_filters(filters)
-    except Exception:
-        pass
+    from app.data import set_global_filters
+    set_global_filters(filters)
     path = pathname.strip("/") if pathname else "estrategico"
     pages = {
         "estrategico": dashboard_estrategico.layout,
