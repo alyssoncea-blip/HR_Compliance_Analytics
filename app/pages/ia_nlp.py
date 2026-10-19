@@ -7,7 +7,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 from app.theme.colors import PETROLEO, AZUL_CLARO, CINZA, BRANCO, VERDE, AMARELO, VERMELHO
-from app.data import ccts_processadas, distribuicao_entidades, cct_evolution_data
+from app.data import ccts_processadas, distribuicao_entidades, cct_evolution_data, cct_clauses, clausulas_relevantes_por_uc
 
 # ---------------------------------------------------------------------------
 # Real data loader for the offline CCT clause extractor output
@@ -17,7 +17,47 @@ EXTRACTED_RULES_PATH = (
     / "data" / "gold" / "governance" / "cct_extracted_rules.json"
 )
 
+EXPECTED_CCT_STATES = ("MG", "RJ", "RN")
+
 UNCATEGORIZED = "nao_classificada"
+
+
+def _cct_clauses_gold() -> pd.DataFrame:
+    """Stage 1 source: gold dim table. Empty when missing/unreadable."""
+    try:
+        df = cct_clauses()
+        return df if not df.empty else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+def _normalize_gold_rules_df(gold_df: pd.DataFrame) -> pd.DataFrame:
+    """Adapt the gold dim frame to the clause contract consumed by the table."""
+    df = gold_df.rename(columns={"clause_title": "title", "source_pdf": "pdf_path"}).copy()
+    if "title" not in df.columns:
+        df["title"] = None
+    if "period" not in df.columns:
+        df["period"] = df.get("pdf_path", pd.Series([""] * len(df), index=df.index)).astype(str).str.split("/").str[3]
+    if "text" not in df.columns:
+        df["text"] = df.get("title")
+    return df
+
+
+def _gold_extraction_doc(gold_df: pd.DataFrame) -> dict:
+    """Extraction-style summary synthesized from gold when JSON is unavailable."""
+    by_state: dict = {}
+    if "union_state" in gold_df.columns:
+        by_state = {str(k): int(v) for k, v in gold_df["union_state"].value_counts().items()}
+    return {
+        "extraction_method": "pypdf + regex rules (promoted to gold)",
+        "source_count": int(gold_df["source_pdf"].nunique()) if "source_pdf" in gold_df.columns else 0,
+        "readable_source_count": int(gold_df["source_pdf"].nunique()) if "source_pdf" in gold_df.columns else 0,
+        "total_clauses": int(len(gold_df)),
+        "avg_confidence": round(float(gold_df["confidence"].fillna(0.0).mean()), 3) if "confidence" in gold_df.columns else 0.0,
+        "by_state": by_state,
+        "by_category": {str(k): int(v) for k, v in gold_df.get("category", pd.Series(dtype=object)).value_counts().items()} if "category" in gold_df.columns else {},
+        "validation": {},
+    }
 
 
 def _load_extracted_rules(path: Path | None = None) -> tuple[dict | None, pd.DataFrame, str | None]:
@@ -237,7 +277,7 @@ def _cct_evolution_fig():
 # ---------------------------------------------------------------------------
 # UI builders
 # ---------------------------------------------------------------------------
-def _rules_table(extracted_data, rules_df, rules_message):
+def _rules_table(extracted_data, rules_df, rules_message, source_label: str | None = None):
     if not rules_df.empty:
         header_style = {
             "borderBottom": "2px solid #e2e8f0", "padding": "5px 8px",
@@ -284,10 +324,21 @@ def _rules_table(extracted_data, rules_df, rules_message):
     else:
         content = rules_message or "Sem cláusulas extraídas."
 
-    return html.Div([
-        html.H6("CLAUSULAS REAIS EXTRAIDAS DAS CCTs (pypdf + regex)", style={"fontWeight": "700", "fontSize": "14px", "color": "#1A202C", "marginBottom": "4px"}),
-        content,
-    ])
+    heading_children = [
+        html.H6(
+            "CLAUSULAS REAIS EXTRAIDAS DAS CCTs (pypdf + regex)",
+            style={"fontWeight": "700", "fontSize": "14px", "color": "#1A202C", "marginBottom": "4px", "display": "inline-block"},
+        ),
+    ]
+    if source_label:
+        heading_children.append(html.Span(
+            source_label,
+            style={
+                "fontSize": "0.62rem", "fontWeight": "700", "color": "white",
+                "backgroundColor": VERDE, "padding": "2px 8px", "borderRadius": "6px", "marginLeft": "6px",
+            },
+        ))
+    return html.Div([html.Div(heading_children, style={"display": "flex", "alignItems": "center", "marginBottom": "4px"}), content])
 
 
 def _ai_metrics(extracted_data, rules_df, rules_message):
@@ -323,9 +374,15 @@ def _ai_metrics(extracted_data, rules_df, rules_message):
             ("IDs com confianca < 80%", str(pending), pending > 0),
             ("Fontes legiveis", f"{readable}/{sources}", False),
             ("Clausulas por estado", by_state_display, False),
-            ("Percentuais em clausulas HE", percent_display, False),
-            ("Validacao jornada semanal vs dim", validation_display, len(validation.get('mismatches') or []) > 0),
         ]
+        if "percent_counts" in extracted_data:
+            metrics.append(("Percentuais em clausulas HE", percent_display, False))
+        if validation:
+            metrics.append((
+                "Validacao jornada semanal vs dim",
+                f"{validation.get('matches', 0)} match / {len(validation.get('mismatches') or [])} mismatch",
+                len(validation.get('mismatches') or []) > 0,
+            ))
     rows = []
     for label, value, alert in metrics:
         rows.append(html.Div([
@@ -345,6 +402,55 @@ def _ai_metrics(extracted_data, rules_df, rules_message):
 
 
 # ---------------------------------------------------------------------------
+# Semantic linkage: CCT categories <-> validation engine UCs
+# ---------------------------------------------------------------------------
+def _cct_uc_block(clauses_df: pd.DataFrame, mapping_df: pd.DataFrame):
+    html_resp_style = {
+        "borderBottom": "2px solid #e2e8f0", "padding": "5px 8px",
+        "fontSize": "0.7rem", "fontWeight": "700", "color": "#1A202C", "textAlign": "left",
+    }
+    cell_resp_style = {"padding": "4px 8px", "fontSize": "0.68rem", "color": "#4A5568", "borderBottom": "1px solid #f7fafc", "textAlign": "left"}
+
+    rows = [html.Tr([
+        html.Th("Estado", style=html_resp_style),
+        html.Th("Categoria da cláusula (CCT)", style=html_resp_style),
+        html.Th("Clausulas", style=html_resp_style),
+        html.Th("Regras do motor (UCs)", style=html_resp_style),
+    ])]
+    if not mapping_df.empty:
+        for _, row in mapping_df.iterrows():
+            rows.append(html.Tr([
+                html.Td(str(row["union_state"]), style=cell_resp_style),
+                html.Td(str(row["category"]), style={**cell_resp_style, "fontWeight": "600"}),
+                html.Td(str(row["clause_count"]), style=cell_resp_style),
+                html.Td(str(row["ucs"]) or "—", style=cell_resp_style),
+            ]))
+    else:
+        rows.append(html.Tr([html.Td("Sem cláusulas classificadas para mapear ao motor.", style=cell_resp_style, colSpan=4)]))
+
+    notes = []
+    present_states = set()
+    if not clauses_df.empty and "union_state" in clauses_df.columns:
+        present_states = set(clauses_df["union_state"].dropna().astype(str).unique())
+    for state in EXPECTED_CCT_STATES:
+        if state in present_states:
+            continue
+        notes.append(html.Div(
+            f"{state}: sem cláusulas extraídas — PDF não legível (scanned, sem camada de texto), "
+            "mapping CCT↔UC indisponível para este estado.",
+            style={"fontSize": "0.66rem", "color": VERMELHO, "marginTop": "4px"},
+        ))
+    return html.Div([
+        html.H6("CCT ↔ REGRAS DO MOTOR (VINCULO SEMANTICO POR ESTADO)", style={"fontWeight": "700", "fontSize": "14px", "color": "#1A202C", "marginBottom": "6px"}),
+        html.Div(
+            html.Table(rows, style={"width": "100%", "borderCollapse": "collapse"}),
+            style={"maxHeight": "220px", "overflowY": "auto"},
+        ),
+        html.Div(notes, style={"marginTop": "2px"}),
+    ], style={"marginTop": "4px"})
+
+
+# ---------------------------------------------------------------------------
 # Layout
 # ---------------------------------------------------------------------------
 def layout():
@@ -359,7 +465,19 @@ def layout():
 
     # ---- Linha 1: KPIs do Motor de IA ----
     ccts_df = _safe_ccts()
+
+    # 3-stage honest degradation: Gold parquet -> governance JSON -> banner.
+    gold_df = _cct_clauses_gold()
     extracted_data, rules_df, rules_message = _load_extracted_rules()
+    if not gold_df.empty:
+        rules_df = _normalize_gold_rules_df(gold_df)
+        rules_message = None
+        source_label = "GOLD · dim_cct_clause.parquet"
+        if extracted_data is None:
+            extracted_data = _gold_extraction_doc(gold_df)
+    else:
+        extracted_data = extracted_data  # noqa: F841 (kept for clarity of stages)
+        source_label = None
 
     ccts_count = len(ccts_df)
     regras_count = int(len(rules_df)) if not rules_df.empty else int(extracted_data.get("total_clauses") or 0) if extracted_data else 0
@@ -399,8 +517,8 @@ def layout():
     ], style=card_style)
 
     # ---- Linha 2: Regras + Treemap ----
-    rules_lines = [_rules_table(extracted_data, rules_df, rules_message)]
-    if not rules_df.empty:
+    rules_lines = [_rules_table(extracted_data, rules_df, rules_message, source_label=source_label)]
+    if not rules_df.empty and extracted_data and "percent_counts" in (extracted_data or {}):
         percent_counts = extracted_data.get("percent_counts") or {}
         percent_lines = [
             html.Span(f"50%: {percent_counts.get('50', 0)}", style={"color": AZUL_CLARO, "fontWeight": "700", "marginRight": "10px"}),
@@ -428,6 +546,12 @@ def layout():
         _ai_metrics(extracted_data, rules_df, rules_message),
     ], style=card_style)
 
+    # ---- Linha 4: CCT <-> Regras do Motor (semantic mapping) ----
+    uc_mapping_df = clausulas_relevantes_por_uc(rules_df)
+    semantic_card = html.Div([
+        _cct_uc_block(rules_df, uc_mapping_df),
+    ], style=card_style)
+
     return html.Div([
         # Linha 1
         dbc.Row([dbc.Col(kpi1, width=3), dbc.Col(kpi2, width=3), dbc.Col(kpi3, width=3), dbc.Col(kpi4, width=3)], className="g-3 mb-3"),
@@ -435,6 +559,8 @@ def layout():
         dbc.Row([dbc.Col(rules_card, width=7), dbc.Col(treemap_card, width=5)], className="g-3 mb-3"),
         # Linha 3
         dbc.Row([dbc.Col(evolution_card, width=7), dbc.Col(metrics_card, width=5)], className="g-3 mb-3"),
+        # Linha 4
+        dbc.Row([dbc.Col(semantic_card, width=12)], className="g-3 mb-3"),
         html.P(
             f"Última atualização: {datetime.now().strftime('%d/%m/%Y %H:%M')}",
             style={"textAlign": "right", "color": "#888", "fontSize": "0.75rem", "marginTop": "12px"},

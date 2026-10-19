@@ -738,6 +738,65 @@ def employee_audit_log(func_id):
 # ---------------------------------------------------------------------------
 # IA / CCT
 # ---------------------------------------------------------------------------
+DIM_CCT_CLAUSE = GOLD / "dim_cct_clause.parquet"
+
+CATEGORY_TO_UCS = {
+    "hora_extra": [1, 2, 6, 10, 22],
+    "adicional_noturno": [3, 24],
+    "banco_de_horas": [4, 16],
+    "jornada": [5, 12, 20, 25, 28],
+    "periculosidade": [13],
+    "insalubridade": [29],
+    "ferias": [31, 32],
+    "reajuste": [11, 23, 30],
+    "beneficios": [],
+    "clausulas_sociais": [],
+}
+
+
+def cct_clauses():
+    """Extracted CCT clauses from the gold dim table (dim_cct_clause.parquet).
+
+    Honest fallback: returns an empty DataFrame when the parquet has not been
+    generated yet — the IA/NLP page degrades to the governance JSON and then
+    to a banner.
+    """
+    if not DIM_CCT_CLAUSE.exists():
+        return pd.DataFrame()
+    params = []
+    cond = _col_conds(params, ("union_state", _GLOBAL_FILTERS.get("estado")))
+    return query(f"""
+        SELECT clause_sk, union_state, source_pdf,
+               clause_number, clause_number_int,
+               clause_title, category, keywords_matched,
+               confidence, page, weekly_hours_extracted, extracted_at
+        FROM read_parquet({gq('dim_cct_clause')})
+        WHERE 1=1{cond}
+        ORDER BY union_state, source_pdf, page
+    """, params)
+
+
+def clausulas_relevantes_por_uc(clauses_df: pd.DataFrame | None = None):
+    """Semantic linkage: CCT clause categories -> validation engine UCs.
+
+    Decision: helper lives in the data layer (app/data.py) so the mapping is
+    queryable/reusable and unit-testable; ia_nlp.py only renders it. When
+    ``clauses_df`` is None the gold table (via ``cct_clauses``) is the source
+    of truth; every zero-UC category and state without readable clauses is
+    simply absent from the output (no fabricated mapping).
+    """
+    if clauses_df is None:
+        clauses_df = cct_clauses()
+    columns = ["union_state", "category", "clause_count", "ucs", "uc_count"]
+    if clauses_df is None or clauses_df.empty or "category" not in clauses_df.columns:
+        return pd.DataFrame(columns=columns)
+    grouped = clauses_df.groupby(["union_state", "category"]).size().reset_index(name="clause_count")
+    mapped = grouped[grouped["category"].isin(CATEGORY_TO_UCS)].copy()
+    mapped["ucs"] = mapped["category"].map(lambda c: ", ".join(f"UC{n}" for n in CATEGORY_TO_UCS[c]))
+    mapped["uc_count"] = mapped["category"].map(lambda c: len(CATEGORY_TO_UCS[c]))
+    mapped = mapped.sort_values(["union_state", "category"]).reset_index(drop=True)
+    return mapped[columns]
+
 def cct_evolution_data():
     params = []
     cond = _col_conds(

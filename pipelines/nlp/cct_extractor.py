@@ -12,9 +12,11 @@ Usage:
 
 Output:
     data/gold/governance/cct_extracted_rules.json
+    data/gold/dim_cct_clause.parquet
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import unicodedata
@@ -25,6 +27,20 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 CCT_ROOT = REPO_ROOT / "Docs" / "CCTs"
 OUTPUT_PATH = REPO_ROOT / "data" / "gold" / "governance" / "cct_extracted_rules.json"
 DIM_CCT_RULE_VERSION = REPO_ROOT / "data" / "gold" / "dim_cct_rule_version.parquet"
+DIM_CCT_CLAUSE = REPO_ROOT / "data" / "gold" / "dim_cct_clause.parquet"
+GOLD_MANIFEST_PATH = REPO_ROOT / "data" / "gold" / "gold_manifest.json"
+
+DIM_CCT_CLAUSE_COLUMNS = [
+    "clause_sk", "union_state", "source_pdf",
+    "clause_number", "clause_number_int",
+    "clause_title", "category", "keywords_matched",
+    "confidence", "page", "weekly_hours_extracted", "extracted_at",
+]
+ON_DEMAND_NOTE = (
+    "Not part of run_pipeline: depends on real PDFs under Docs/CCTs/ and is "
+    "produced on demand (manual run / tests). Other Gold targets are built by "
+    "silver_to_gold.py / refresh_aggs.py."
+)
 
 try:
     from pypdf import PdfReader
@@ -451,6 +467,100 @@ def validate_weekly_hours(extracted: list[int], dim_values: list[int]) -> str:
     return "match" if set(extracted).issubset(set(dim_values)) else "mismatch"
 
 
+# ---------------------------------------------------------------------------
+# Gold promotion: dim_cct_clause.parquet (queryable via SQL in the dashboards)
+# ---------------------------------------------------------------------------
+def clause_sk(union_state: str, source_pdf: str, clause_number: str, page: int) -> str:
+    """Deterministic surrogate key: sha256 of state|pdf|clause|page."""
+    key = f"{union_state}|{source_pdf}|{clause_number}|{page}"
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+
+
+def normalize_clause_number(clause: dict) -> int | None:
+    """Best-effort INT normalization of the raw clause number (None if not numeric)."""
+    if clause.get("clause_order") is not None:
+        return int(clause["clause_order"])
+    digits = re.findall(r"\d{1,3}", str(clause.get("clause_number") or ""))
+    return int(digits[0]) if digits else None
+
+
+def build_clause_gold_frame(clauses: list[dict], extracted_at: str):
+    """Build the typed Pandas frame for the gold dim table."""
+    import pandas as pd
+
+    rows = []
+    for clause in clauses:
+        source_pdf = str(clause.get("pdf_path") or "")
+        raw_number = str(clause.get("clause_number") or "")
+        page = int(clause.get("page") or 0)
+        weekly_hours = clause.get("weekly_hours") or []
+        rows.append({
+            "clause_sk": clause_sk(str(clause.get("union_state") or ""), source_pdf, raw_number, page),
+            "union_state": str(clause.get("union_state") or ""),
+            "source_pdf": source_pdf,
+            "clause_number": raw_number,
+            "clause_number_int": normalize_clause_number(clause),
+            "clause_title": str(clause.get("title") or ""),
+            "category": str(clause.get("category") or UNCATEGORIZED),
+            "keywords_matched": json.dumps(clause.get("keywords_matched") or [], ensure_ascii=False),
+            "confidence": float(clause.get("confidence") or 0.0),
+            "page": page,
+            "weekly_hours_extracted": json.dumps(weekly_hours, ensure_ascii=False) if weekly_hours else "",
+            "extracted_at": extracted_at,
+        })
+    return pd.DataFrame(rows, columns=DIM_CCT_CLAUSE_COLUMNS)
+
+
+def write_gold_clause_parquet(clauses: list[dict], extracted_at: str) -> int | None:
+    """Write dim_cct_clause.parquet (ZSTD, repo Gold pattern). Returns row count or None."""
+    if not clauses:
+        return None
+    try:
+        import duckdb
+
+        frame = build_clause_gold_frame(clauses, extracted_at)
+        DIM_CCT_CLAUSE.parent.mkdir(parents=True, exist_ok=True)
+        con = duckdb.connect()
+        con.register("clause_gold_df", frame)
+        con.execute(
+            f"COPY (SELECT * FROM clause_gold_df "
+            f"ORDER BY union_state, source_pdf, page, clause_number_int) "
+            f"TO '{DIM_CCT_CLAUSE.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)"
+        )
+        con.close()
+        return len(frame)
+    except Exception as exc:
+        print(f"  ! dim_cct_clause.parquet not written: {exc}")
+        return None
+
+
+def update_gold_manifest(parquet_written: bool) -> None:
+    """Register dim_cct_clause in gold_manifest.json as an on-demand target."""
+    manifest: dict = {}
+    if GOLD_MANIFEST_PATH.exists():
+        try:
+            with open(GOLD_MANIFEST_PATH, encoding="utf-8") as handle:
+                manifest = json.load(handle)
+        except (json.JSONDecodeError, OSError):
+            manifest = {}
+    targets = list(manifest.get("targets") or [])
+    if "dim_cct_clause" not in targets:
+        targets.append("dim_cct_clause")
+    manifest["targets"] = targets
+    on_demand = dict(manifest.get("on_demand") or {})
+    on_demand["dim_cct_clause"] = {
+        "produced_by": "pipelines/nlp/cct_extractor.py",
+        "in_run_pipeline": False,
+        "trigger": ON_DEMAND_NOTE,
+        "written": bool(parquet_written),
+    }
+    manifest["on_demand"] = on_demand
+    manifest.setdefault("pipeline", "cct_extractor")
+    manifest.setdefault("run_at", datetime.now(timezone.utc).isoformat())
+    GOLD_MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    GOLD_MANIFEST_PATH.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
 def run() -> dict:
     """Extract clauses from every real CCT PDF and persist the gold JSON."""
     pdfs = find_cct_pdfs()
@@ -535,12 +645,18 @@ def run() -> dict:
 
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     OUTPUT_PATH.write_text(json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    gold_rows = write_gold_clause_parquet(clauses, document["generated_at"])
+    update_gold_manifest(gold_rows is not None)
     return document
 
 
 def main() -> None:
     document = run()
     print(f"cct_extracted_rules.json -> {OUTPUT_PATH}")
+    if DIM_CCT_CLAUSE.exists():
+        print(f"dim_cct_clause.parquet -> {DIM_CCT_CLAUSE} (gold, on-demand target)")
+    print(f"gold_manifest.json        -> {GOLD_MANIFEST_PATH}")
     print(f"sources={document['source_count']} readable={document['readable_source_count']} "
           f"clauses={document['total_clauses']} avg_confidence={document['avg_confidence']}")
     print(f"by_state={document['by_state']}")
