@@ -5,6 +5,7 @@ plotly==5.24.1
 pandas>=2.0
 duckdb>=0.10
 pyarrow>=14.0
+pypdf>=4.0
 
 # Dev / Test
 pytest>=7.0
