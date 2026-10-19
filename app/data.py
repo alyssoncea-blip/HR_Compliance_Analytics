@@ -14,7 +14,17 @@ _GLOBAL_FILTERS = {"start_date": None, "end_date": None, "estado": None, "unidad
 
 
 def clear_query_cache():
-    query.cache_clear()
+    _query_cached.cache_clear()
+
+
+def _col_conds(params: list, *pairs: tuple) -> str:
+    """Build 'AND col = ?' fragments from (column, value) pairs, collecting params."""
+    conds = []
+    for col, value in pairs:
+        if value:
+            params.append(value)
+            conds.append(f"{col} = ?")
+    return (" AND " + " AND ".join(conds)) if conds else ""
 
 
 def set_global_filters(filters: dict | None):
@@ -37,32 +47,36 @@ def is_demo_mode() -> bool:
 
 
 def _filters_employee(alias="e", unit_alias="u", union_alias="un"):
-    conds = []
-    if _GLOBAL_FILTERS.get("estado"):
-        conds.append(f"{unit_alias}.state = '{_GLOBAL_FILTERS['estado']}'")
-    if _GLOBAL_FILTERS.get("unidade"):
-        conds.append(f"{unit_alias}.name = '{_GLOBAL_FILTERS['unidade']}'")
-    if _GLOBAL_FILTERS.get("sindicato"):
-        conds.append(f"{union_alias}.name = '{_GLOBAL_FILTERS['sindicato']}'")
-    return ("WHERE " + " AND ".join(conds)) if conds else ""
+    params = []
+    cond = _col_conds(
+        params,
+        (f"{unit_alias}.state", _GLOBAL_FILTERS.get("estado")),
+        (f"{unit_alias}.name", _GLOBAL_FILTERS.get("unidade")),
+        (f"{union_alias}.name", _GLOBAL_FILTERS.get("sindicato")),
+    )
+    return ("WHERE " + cond.removeprefix(" AND ")) if cond else "", params
 
 
 def _filters_competence(alias="m"):
+    params = []
     conds = []
     if _GLOBAL_FILTERS.get("start_date"):
-        conds.append(f"MAKE_DATE({alias}.year, {alias}.month, 1) >= DATE '{_GLOBAL_FILTERS['start_date']}'")
+        conds.append(f"MAKE_DATE({alias}.year, {alias}.month, 1) >= ?")
+        params.append(_GLOBAL_FILTERS["start_date"])
     if _GLOBAL_FILTERS.get("end_date"):
-        conds.append(f"MAKE_DATE({alias}.year, {alias}.month, 1) <= DATE '{_GLOBAL_FILTERS['end_date']}'")
-    return (" AND " + " AND ".join(conds)) if conds else ""
+        conds.append(f"MAKE_DATE({alias}.year, {alias}.month, 1) <= ?")
+        params.append(_GLOBAL_FILTERS["end_date"])
+    return (" AND " + " AND ".join(conds)) if conds else "", params
 
 
 def _filters_where_unit(alias="u"):
-    conds = []
-    if _GLOBAL_FILTERS.get("estado"):
-        conds.append(f"{alias}.state = '{_GLOBAL_FILTERS['estado']}'")
-    if _GLOBAL_FILTERS.get("unidade"):
-        conds.append(f"{alias}.name = '{_GLOBAL_FILTERS['unidade']}'")
-    return ("WHERE " + " AND ".join(conds)) if conds else ""
+    params = []
+    cond = _col_conds(
+        params,
+        (f"{alias}.state", _GLOBAL_FILTERS.get("estado")),
+        (f"{alias}.name", _GLOBAL_FILTERS.get("unidade")),
+    )
+    return ("WHERE " + cond.removeprefix(" AND ")) if cond else "", params
 
 def get_con():
     global _con
@@ -74,13 +88,19 @@ def pq(path): return ("'" + str((SILVER / f"{path}.parquet").as_posix()) + "'").
 def gq(path): return ("'" + str((GOLD / f"{path}.parquet").as_posix()) + "'").replace("//", "/")
 
 @lru_cache(maxsize=256)
-def query(sql: str) -> pd.DataFrame:
-    return get_con().execute(sql).fetchdf()
+def _query_cached(sql: str, params: tuple) -> pd.DataFrame:
+    return get_con().execute(sql, list(params) if params else None).fetchdf()
+
+
+def query(sql: str, params=None) -> pd.DataFrame:
+    """Execute parameterized SQL; `params` is optional for legacy string-only calls."""
+    return _query_cached(sql, tuple(params) if params else ())
 
 # ---------------------------------------------------------------------------
 # Estratégico
 # ---------------------------------------------------------------------------
 def kpi_ferias_vencidas():
+    where, params = _filters_employee('e', 'u', 'un')
     return query(f"""
         SELECT count(*) AS total,
                SUM(CASE WHEN v.status IN ('expired','impending') THEN 1 ELSE 0 END) AS vencidas
@@ -88,10 +108,11 @@ def kpi_ferias_vencidas():
         JOIN read_parquet({pq('dim_employee')}) e USING(employee_id)
         JOIN read_parquet({pq('dim_unit')}) u ON e.unit_id = u.unit_id
         JOIN read_parquet({pq('dim_union')}) un ON e.union_id = un.union_id
-        {_filters_employee('e','u','un')}
-    """)
+        {where}
+    """, params)
 
 def kpi_passivo_ferias():
+    where, params = _filters_employee('e', 'u', 'un')
     return query(f"""
         SELECT ROUND(SUM(CASE WHEN v.status='expired' THEN e.base_salary*2
                               WHEN v.status='impending' THEN e.base_salary*1.5 ELSE 0 END),0) AS passivo_total
@@ -99,10 +120,17 @@ def kpi_passivo_ferias():
         JOIN read_parquet({pq('dim_employee')}) e ON v.employee_id = e.employee_id
         JOIN read_parquet({pq('dim_unit')}) u ON e.unit_id = u.unit_id
         JOIN read_parquet({pq('dim_union')}) un ON e.union_id = un.union_id
-        {_filters_employee('e','u','un')}
-    """)
+        {where}
+    """, params)
 
 def kpi_proximos_vencimento():
+    params = []
+    cond = _col_conds(
+        params,
+        ("u.state", _GLOBAL_FILTERS.get('estado')),
+        ("u.name", _GLOBAL_FILTERS.get('unidade')),
+        ("un.name", _GLOBAL_FILTERS.get('sindicato')),
+    )
     return query(f"""
         SELECT count(*) AS qtd,
                SUM(CASE WHEN v.concession_deadline - current_date <= 30 THEN 1 ELSE 0 END) AS critico,
@@ -111,13 +139,11 @@ def kpi_proximos_vencimento():
         JOIN read_parquet({pq('dim_employee')}) e USING(employee_id)
         JOIN read_parquet({pq('dim_unit')}) u ON e.unit_id = u.unit_id
         JOIN read_parquet({pq('dim_union')}) un ON e.union_id = un.union_id
-        WHERE v.status IN ('pending','impending') AND v.concession_deadline >= current_date
-          {"AND u.state = '" + _GLOBAL_FILTERS['estado'] + "'" if _GLOBAL_FILTERS.get('estado') else ""}
-          {"AND u.name = '" + _GLOBAL_FILTERS['unidade'] + "'" if _GLOBAL_FILTERS.get('unidade') else ""}
-          {"AND un.name = '" + _GLOBAL_FILTERS['sindicato'] + "'" if _GLOBAL_FILTERS.get('sindicato') else ""}
-    """)
+        WHERE v.status IN ('pending','impending') AND v.concession_deadline >= current_date{cond}
+    """, params)
 
 def evolucao_risco():
+    comp_cond, params = _filters_competence('m')
     return query(f"""
         SELECT m.year, m.month,
                m.year || '-' || LPAD(CAST(m.month AS VARCHAR),2,'0') AS competencia,
@@ -130,12 +156,18 @@ def evolucao_risco():
         JOIN read_parquet({pq('dim_unit')}) u ON e.unit_id = u.unit_id
         JOIN read_parquet({pq('dim_union')}) un ON e.union_id = un.union_id
         WHERE TRY_CAST(SPLIT_PART(f.competence,'-',2) AS INT) IS NOT NULL
-          AND m.year>=2024
-          {_filters_competence('m')}
+          AND m.year>=2024{comp_cond}
         GROUP BY m.year,m.month ORDER BY m.year,m.month
-    """)
+    """, params)
 
 def passivo_por_unidade():
+    params = []
+    cond = _col_conds(
+        params,
+        ("u.state", _GLOBAL_FILTERS.get('estado')),
+        ("u.name", _GLOBAL_FILTERS.get('unidade')),
+        ("un.name", _GLOBAL_FILTERS.get('sindicato')),
+    )
     return query(f"""
         SELECT u.name AS unidade, u.state AS estado,
                ROUND(SUM(f.estimated_impact),0) AS passivo
@@ -143,17 +175,17 @@ def passivo_por_unidade():
         JOIN read_parquet({pq('dim_employee')}) e ON f.employee_id=e.employee_id
         JOIN read_parquet({pq('dim_unit')}) u ON e.unit_id=u.unit_id
         JOIN read_parquet({pq('dim_union')}) un ON e.union_id=un.union_id
-        WHERE 1=1
-          {"AND u.state = '" + _GLOBAL_FILTERS['estado'] + "'" if _GLOBAL_FILTERS.get('estado') else ""}
-          {"AND u.name = '" + _GLOBAL_FILTERS['unidade'] + "'" if _GLOBAL_FILTERS.get('unidade') else ""}
-          {"AND un.name = '" + _GLOBAL_FILTERS['sindicato'] + "'" if _GLOBAL_FILTERS.get('sindicato') else ""}
+        WHERE 1=1{cond}
         GROUP BY u.name,u.state ORDER BY passivo DESC LIMIT 5
-    """)
+    """, params)
 
 # ---------------------------------------------------------------------------
 # Analítico
 # ---------------------------------------------------------------------------
 def distribuicao_estado():
+    params = []
+    estado_clause = _col_conds(params, ("eb.estado", _GLOBAL_FILTERS.get('estado')))
+    estado_where = ("WHERE " + estado_clause.removeprefix(" AND ")) if estado_clause else ""
     return query(f"""
         WITH estado_base AS (
             SELECT u.state AS estado, count(*) AS funcionarios
@@ -185,11 +217,17 @@ def distribuicao_estado():
         FROM estado_base eb
         LEFT JOIN estado_passivo ep ON eb.estado = ep.estado
         LEFT JOIN estado_vencidas ev ON eb.estado = ev.estado
-        {"WHERE eb.estado = '" + _GLOBAL_FILTERS['estado'] + "'" if _GLOBAL_FILTERS.get('estado') else ""}
+        {estado_where}
         ORDER BY ranking
-    """)
+    """, params)
 
 def ranking_unidades():
+    params = []
+    cond = _col_conds(
+        params,
+        ("ub.estado", _GLOBAL_FILTERS.get('estado')),
+        ("ub.unidade", _GLOBAL_FILTERS.get('unidade')),
+    )
     return query(f"""
         WITH unid_base AS (
             SELECT u.name AS unidade, u.state AS estado,
@@ -228,28 +266,30 @@ def ranking_unidades():
         FROM unid_base ub
         LEFT JOIN unid_passivo up ON ub.unidade = up.unidade
         LEFT JOIN unid_vencidas uv ON ub.unidade = uv.unidade
-        WHERE 1=1
-          {"AND ub.estado = '" + _GLOBAL_FILTERS['estado'] + "'" if _GLOBAL_FILTERS.get('estado') else ""}
-          {"AND ub.unidade = '" + _GLOBAL_FILTERS['unidade'] + "'" if _GLOBAL_FILTERS.get('unidade') else ""}
+        WHERE 1=1{cond}
         ORDER BY COALESCE(up.passivo,0) DESC, COALESCE(uv.pct_vencidas,0) DESC
         LIMIT 10
-    """)
+    """, params)
 
 def resumo_reconciliacao():
+    params = []
+    cond = _col_conds(
+        params,
+        ("u.state", _GLOBAL_FILTERS.get('estado')),
+        ("u.name", _GLOBAL_FILTERS.get('unidade')),
+        ("un.name", _GLOBAL_FILTERS.get('sindicato')),
+    )
     return query(f"""
         SELECT count(*) AS total_inconsistencias,
                ROUND(SUM(CASE WHEN severity='critico' THEN 1 ELSE 0 END)*100.0/count(*),1) AS pct_critico,
                ROUND(SUM(financial_impact),0) AS impacto_total,
-               count(DISTINCT employee_id) AS funcionarios_afetados
+               count(DISTINCT f.employee_id) AS funcionarios_afetados
         FROM read_parquet({gq('fact_detected_inconsistency')}) f
         LEFT JOIN read_parquet({pq('dim_employee')}) e ON f.employee_id = e.employee_id
         LEFT JOIN read_parquet({pq('dim_unit')}) u ON e.unit_id = u.unit_id
         LEFT JOIN read_parquet({pq('dim_union')}) un ON e.union_id = un.union_id
-        WHERE 1=1
-          {"AND u.state = '" + _GLOBAL_FILTERS['estado'] + "'" if _GLOBAL_FILTERS.get('estado') else ""}
-          {"AND u.name = '" + _GLOBAL_FILTERS['unidade'] + "'" if _GLOBAL_FILTERS.get('unidade') else ""}
-          {"AND un.name = '" + _GLOBAL_FILTERS['sindicato'] + "'" if _GLOBAL_FILTERS.get('sindicato') else ""}
-    """)
+        WHERE 1=1{cond}
+    """, params)
 
 # ---------------------------------------------------------------------------
 # Auditoria
@@ -263,17 +303,17 @@ def perfil_funcionario(func_id):
         LEFT JOIN read_parquet({pq('dim_unit')}) u ON e.unit_id=u.unit_id
         LEFT JOIN read_parquet({pq('dim_union')}) uni ON e.union_id=uni.union_id
         LEFT JOIN read_parquet({pq('dim_position')}) p ON e.position_id=p.position_id
-        WHERE e.employee_id={func_id}
-    """)
+        WHERE e.employee_id = ?
+    """, (func_id,))
 
 def inconsistencias_funcionario(func_id):
     return query(f"""
         SELECT competence,use_case,rule_name,severity,category,
                detected_value,expected_value,financial_impact,detail
         FROM read_parquet({gq('fact_detected_inconsistency')})
-        WHERE employee_id={func_id}
+        WHERE employee_id = ?
         ORDER BY financial_impact DESC LIMIT 50
-    """)
+    """, (func_id,))
 
 def holerite_funcionario(func_id):
     return query(f"""
@@ -284,14 +324,15 @@ def holerite_funcionario(func_id):
                p.insalubridade_amount, p.dsr_amount,
                p.gross_total, p.inss_discount, p.irrf_discount, p.net_total
         FROM read_parquet({pq('fact_payroll')}) p
-        WHERE p.employee_id={func_id}
+        WHERE p.employee_id = ?
         ORDER BY p.date_sk DESC LIMIT 24
-    """)
+    """, (func_id,))
 
 # ---------------------------------------------------------------------------
 # People
 # ---------------------------------------------------------------------------
 def headcount():
+    where, params = _filters_employee('e', 'u', 'un')
     return query(f"""
         SELECT count(*) AS total,
                SUM(CASE WHEN gender='M' THEN 1 ELSE 0 END) AS masculino,
@@ -301,10 +342,17 @@ def headcount():
         FROM read_parquet({pq('dim_employee')}) e
         JOIN read_parquet({pq('dim_unit')}) u ON e.unit_id = u.unit_id
         JOIN read_parquet({pq('dim_union')}) un ON e.union_id = un.union_id
-        {_filters_employee('e','u','un')}
-    """)
+        {where}
+    """, params)
 
 def piramide_salarial():
+    params = []
+    cond = _col_conds(
+        params,
+        ("u.state", _GLOBAL_FILTERS.get('estado')),
+        ("u.name", _GLOBAL_FILTERS.get('unidade')),
+        ("un.name", _GLOBAL_FILTERS.get('sindicato')),
+    )
     return query(f"""
         SELECT p.name AS cargo, e.gender,
                ROUND(AVG(e.base_salary),0) AS salario_medio, count(*) AS qtd
@@ -312,14 +360,18 @@ def piramide_salarial():
         JOIN read_parquet({pq('dim_position')}) p ON e.position_id=p.position_id
         JOIN read_parquet({pq('dim_unit')}) u ON e.unit_id = u.unit_id
         JOIN read_parquet({pq('dim_union')}) un ON e.union_id = un.union_id
-        WHERE e.status='active'
-          {"AND u.state = '" + _GLOBAL_FILTERS['estado'] + "'" if _GLOBAL_FILTERS.get('estado') else ""}
-          {"AND u.name = '" + _GLOBAL_FILTERS['unidade'] + "'" if _GLOBAL_FILTERS.get('unidade') else ""}
-          {"AND un.name = '" + _GLOBAL_FILTERS['sindicato'] + "'" if _GLOBAL_FILTERS.get('sindicato') else ""}
+        WHERE e.status='active'{cond}
         GROUP BY p.name, e.gender ORDER BY salario_medio DESC
-    """)
+    """, params)
 
 def faixa_etaria():
+    params = []
+    cond = _col_conds(
+        params,
+        ("u.state", _GLOBAL_FILTERS.get('estado')),
+        ("u.name", _GLOBAL_FILTERS.get('unidade')),
+        ("un.name", _GLOBAL_FILTERS.get('sindicato')),
+    )
     return query(f"""
         SELECT CASE
             WHEN EXTRACT(YEAR FROM current_date)-EXTRACT(YEAR FROM birth_date) < 25 THEN '18-25'
@@ -332,12 +384,9 @@ def faixa_etaria():
         FROM read_parquet({pq('dim_employee')}) e
         JOIN read_parquet({pq('dim_unit')}) u ON e.unit_id = u.unit_id
         JOIN read_parquet({pq('dim_union')}) un ON e.union_id = un.union_id
-        WHERE 1=1
-          {"AND u.state = '" + _GLOBAL_FILTERS['estado'] + "'" if _GLOBAL_FILTERS.get('estado') else ""}
-          {"AND u.name = '" + _GLOBAL_FILTERS['unidade'] + "'" if _GLOBAL_FILTERS.get('unidade') else ""}
-          {"AND un.name = '" + _GLOBAL_FILTERS['sindicato'] + "'" if _GLOBAL_FILTERS.get('sindicato') else ""}
+        WHERE 1=1{cond}
         GROUP BY faixa ORDER BY faixa
-    """)
+    """, params)
 
 # ---------------------------------------------------------------------------
 # Governança
@@ -364,6 +413,13 @@ def observability_status():
     return pd.DataFrame(out)
 
 def orfaos():
+    params = []
+    cond = _col_conds(
+        params,
+        ("u.state", _GLOBAL_FILTERS.get('estado')),
+        ("u.name", _GLOBAL_FILTERS.get('unidade')),
+        ("un.name", _GLOBAL_FILTERS.get('sindicato')),
+    )
     return query(f"""
         WITH ponto_mensal AS (
             SELECT
@@ -381,12 +437,9 @@ def orfaos():
         JOIN read_parquet({pq('dim_union')}) un ON e.union_id = un.union_id
         LEFT JOIN ponto_mensal t
             ON f.employee_id=t.employee_id AND f.year=t.year AND f.month=t.month
-        WHERE COALESCE(t.qtd_registros_ponto, 0) = 0
-          {"AND u.state = '" + _GLOBAL_FILTERS['estado'] + "'" if _GLOBAL_FILTERS.get('estado') else ""}
-          {"AND u.name = '" + _GLOBAL_FILTERS['unidade'] + "'" if _GLOBAL_FILTERS.get('unidade') else ""}
-          {"AND un.name = '" + _GLOBAL_FILTERS['sindicato'] + "'" if _GLOBAL_FILTERS.get('sindicato') else ""}
+        WHERE COALESCE(t.qtd_registros_ponto, 0) = 0{cond}
         GROUP BY f.employee_id ORDER BY competencias_sem_ponto DESC LIMIT 20
-    """)
+    """, params)
 
 # ---------------------------------------------------------------------------
 # Reconciliação
@@ -408,33 +461,33 @@ def reconciliacao_mensal_funcionario(func_id):
                m.periculosidade_inconsistencies, m.payment_inconsistencies,
                m.total_inconsistencies
         FROM read_parquet({gq('fact_monthly_employee')}) m
-        WHERE m.employee_id = {func_id}
+        WHERE m.employee_id = ?
         ORDER BY m.year DESC, m.month DESC
         LIMIT 12
-    """)
+    """, (func_id,))
 
 def pagamentos_funcionario(func_id):
     return query(f"""
-        SELECT CAST(p.date_sk AS VARCHAR) AS competence,
+        SELECT p.competence AS competence,
                p.expected_amount, p.paid_amount,
                (p.expected_amount - p.paid_amount) AS divergencia,
                p.payment_date, p.payment_status, p.receipt_code
         FROM read_parquet({pq('fact_payment')}) p
-        WHERE p.employee_id = {func_id}
-        ORDER BY p.date_sk DESC
+        WHERE p.employee_id = ?
+        ORDER BY p.competence DESC
         LIMIT 12
-    """)
+    """, (func_id,))
 
 def banco_horas_funcionario(func_id):
     return query(f"""
-        SELECT CAST(h.date_sk AS VARCHAR) AS competence,
+        SELECT h.competence AS competence,
                h.previous_balance, h.credits, h.debits,
                h.current_balance, h.negative_balance
         FROM read_parquet({pq('fact_hour_bank')}) h
-        WHERE h.employee_id = {func_id}
-        ORDER BY h.date_sk DESC
+        WHERE h.employee_id = ?
+        ORDER BY h.competence DESC
         LIMIT 12
-    """)
+    """, (func_id,))
 
 def resumo_reconciliacao_funcionario(func_id):
     return query(f"""
@@ -449,13 +502,20 @@ def resumo_reconciliacao_funcionario(func_id):
             SUM(CASE WHEN m.hour_bank_negative = 1 THEN 1 ELSE 0 END) AS meses_banco_negativo,
             SUM(CASE WHEN m.hour_bank_exceeded = 1 THEN 1 ELSE 0 END) AS meses_banco_excedido
         FROM read_parquet({gq('fact_monthly_employee')}) m
-        WHERE m.employee_id = {func_id}
-    """)
+        WHERE m.employee_id = ?
+    """, (func_id,))
 
 # ---------------------------------------------------------------------------
 # Operational / Dashboard-level aggregations
 # ---------------------------------------------------------------------------
 def turnover_anual():
+    params = []
+    cond = _col_conds(
+        params,
+        ("u.state", _GLOBAL_FILTERS.get('estado')),
+        ("u.name", _GLOBAL_FILTERS.get('unidade')),
+        ("un.name", _GLOBAL_FILTERS.get('sindicato')),
+    )
     return query(f"""
         WITH latest_year AS (
             SELECT COALESCE(MAX(EXTRACT(YEAR FROM termination_date)), EXTRACT(YEAR FROM current_date))
@@ -469,13 +529,17 @@ def turnover_anual():
         JOIN read_parquet({pq('dim_employee')}) e ON t.employee_id = e.employee_id
         JOIN read_parquet({pq('dim_unit')}) u ON e.unit_id = u.unit_id
         JOIN read_parquet({pq('dim_union')}) un ON e.union_id = un.union_id
-        WHERE EXTRACT(YEAR FROM t.termination_date) = (SELECT * FROM latest_year)
-          {"AND u.state = '" + _GLOBAL_FILTERS['estado'] + "'" if _GLOBAL_FILTERS.get('estado') else ""}
-          {"AND u.name = '" + _GLOBAL_FILTERS['unidade'] + "'" if _GLOBAL_FILTERS.get('unidade') else ""}
-          {"AND un.name = '" + _GLOBAL_FILTERS['sindicato'] + "'" if _GLOBAL_FILTERS.get('sindicato') else ""}
-    """)
+        WHERE EXTRACT(YEAR FROM t.termination_date) = (SELECT * FROM latest_year){cond}
+    """, params)
 
 def equidade_salarial():
+    params = []
+    cond = _col_conds(
+        params,
+        ("u.state", _GLOBAL_FILTERS.get('estado')),
+        ("u.name", _GLOBAL_FILTERS.get('unidade')),
+        ("un.name", _GLOBAL_FILTERS.get('sindicato')),
+    )
     return query(f"""
         SELECT ROUND(
             AVG(CASE WHEN gender='F' THEN base_salary END) /
@@ -484,23 +548,24 @@ def equidade_salarial():
         FROM read_parquet({pq('dim_employee')}) e
         JOIN read_parquet({pq('dim_unit')}) u ON e.unit_id = u.unit_id
         JOIN read_parquet({pq('dim_union')}) un ON e.union_id = un.union_id
-        WHERE e.status='active'
-          {"AND u.state = '" + _GLOBAL_FILTERS['estado'] + "'" if _GLOBAL_FILTERS.get('estado') else ""}
-          {"AND u.name = '" + _GLOBAL_FILTERS['unidade'] + "'" if _GLOBAL_FILTERS.get('unidade') else ""}
-          {"AND un.name = '" + _GLOBAL_FILTERS['sindicato'] + "'" if _GLOBAL_FILTERS.get('sindicato') else ""}
-    """)
+        WHERE e.status='active'{cond}
+    """, params)
 
 def movimentacao_mensal_12m():
+    params = []
+    cond = _col_conds(
+        params,
+        ("u.state", _GLOBAL_FILTERS.get('estado')),
+        ("u.name", _GLOBAL_FILTERS.get('unidade')),
+        ("un.name", _GLOBAL_FILTERS.get('sindicato')),
+    )
     return query(f"""
         WITH emp_filtered AS (
             SELECT e.employee_id
             FROM read_parquet({pq('dim_employee')}) e
             JOIN read_parquet({pq('dim_unit')}) u ON e.unit_id = u.unit_id
             JOIN read_parquet({pq('dim_union')}) un ON e.union_id = un.union_id
-            WHERE 1=1
-              {"AND u.state = '" + _GLOBAL_FILTERS['estado'] + "'" if _GLOBAL_FILTERS.get('estado') else ""}
-              {"AND u.name = '" + _GLOBAL_FILTERS['unidade'] + "'" if _GLOBAL_FILTERS.get('unidade') else ""}
-              {"AND un.name = '" + _GLOBAL_FILTERS['sindicato'] + "'" if _GLOBAL_FILTERS.get('sindicato') else ""}
+            WHERE 1=1{cond}
         ),
         meses AS (
             SELECT unnest(generate_series(1,12)) AS mes_num
@@ -545,19 +610,23 @@ def movimentacao_mensal_12m():
         LEFT JOIN promocoes p ON m.mes_num = p.m
         LEFT JOIN ausencias au ON m.mes_num = au.m
         ORDER BY m.mes_num
-    """)
+    """, params)
 
 def saude_organizacional():
+    params = []
+    cond = _col_conds(
+        params,
+        ("u.state", _GLOBAL_FILTERS.get('estado')),
+        ("u.name", _GLOBAL_FILTERS.get('unidade')),
+        ("un.name", _GLOBAL_FILTERS.get('sindicato')),
+    )
     return query(f"""
         WITH emp_filtered AS (
             SELECT e.employee_id
             FROM read_parquet({pq('dim_employee')}) e
             JOIN read_parquet({pq('dim_unit')}) u ON e.unit_id = u.unit_id
             JOIN read_parquet({pq('dim_union')}) un ON e.union_id = un.union_id
-            WHERE 1=1
-              {"AND u.state = '" + _GLOBAL_FILTERS['estado'] + "'" if _GLOBAL_FILTERS.get('estado') else ""}
-              {"AND u.name = '" + _GLOBAL_FILTERS['unidade'] + "'" if _GLOBAL_FILTERS.get('unidade') else ""}
-              {"AND un.name = '" + _GLOBAL_FILTERS['sindicato'] + "'" if _GLOBAL_FILTERS.get('sindicato') else ""}
+            WHERE 1=1{cond}
         ),
         base AS (
             SELECT
@@ -592,24 +661,24 @@ def saude_organizacional():
         LEFT JOIN overtime_stats os ON true
         LEFT JOIN leave_stats ls ON true
         LEFT JOIN bank_stats bs ON true
-    """)
+    """, params)
 
 def passivo_funcionario(func_id):
     return query(f"""
         SELECT ROUND(SUM(estimated_impact), 0) AS passivo_total
         FROM read_parquet({gq('fact_passivo_trabalhista')})
-        WHERE employee_id = {func_id}
-    """)
+        WHERE employee_id = ?
+    """, (func_id,))
 
 def employee_vacation_timeline(func_id):
     return query(f"""
         SELECT acquisition_start, acquisition_end, concession_deadline,
                days_taken, days_sold, status
         FROM read_parquet({pq('vacations')})
-        WHERE employee_id = {func_id}
+        WHERE employee_id = ?
         ORDER BY acquisition_start DESC
         LIMIT 5
-    """)
+    """, (func_id,))
 
 def employee_registration_checks(func_id):
     return query(f"""
@@ -623,8 +692,8 @@ def employee_registration_checks(func_id):
             CASE WHEN e.weekly_hours <= 44 THEN 1 ELSE 0 END AS jornada_dentro_limite
         FROM read_parquet({pq('dim_employee')}) e
         LEFT JOIN read_parquet({pq('dim_union')}) u ON e.union_id = u.union_id
-        WHERE e.employee_id = {func_id}
-    """)
+        WHERE e.employee_id = ?
+    """, (func_id,))
 
 def employee_risk_status(func_id):
     return query(f"""
@@ -637,20 +706,20 @@ def employee_risk_status(func_id):
                     ELSE 'Regular'
                 END)
                 FROM read_parquet({pq('vacations')}) v
-                WHERE v.employee_id = {func_id}),
+                WHERE v.employee_id = ?),
             'Regular'
             ) AS risk_level,
             COALESCE(
                 (SELECT MAX(v.concession_deadline)
                 FROM read_parquet({pq('vacations')}) v
-                WHERE v.employee_id = {func_id} AND v.status = 'expired'),
+                WHERE v.employee_id = ? AND v.status = 'expired'),
             NULL) AS latest_expired,
             COALESCE(
                 (SELECT COUNT(*)
                 FROM read_parquet({gq('fact_detected_inconsistency')})
-                WHERE employee_id = {func_id}),
+                WHERE employee_id = ?),
             0) AS inconsistency_count
-    """)
+    """, (func_id, func_id, func_id))
 
 def employee_audit_log(func_id):
     return query(f"""
@@ -661,36 +730,51 @@ def employee_audit_log(func_id):
                     WHEN severity = 'alto' THEN '#FEF3C7'
                     ELSE '#E6F7FF' END AS color
         FROM read_parquet({gq('fact_detected_inconsistency')})
-        WHERE employee_id = {func_id}
+        WHERE employee_id = ?
         ORDER BY competence DESC
         LIMIT 20
-    """)
+    """, (func_id,))
 
 # ---------------------------------------------------------------------------
 # IA / CCT
 # ---------------------------------------------------------------------------
 def cct_evolution_data():
+    params = []
+    cond = _col_conds(
+        params,
+        ("state", _GLOBAL_FILTERS.get('estado')),
+        ("name", _GLOBAL_FILTERS.get('sindicato')),
+    )
     return query(f"""
         SELECT name, state, cct_year_start, cct_year_end,
                salary_adjustment_percent, base_salary_min,
                he_sunday_percent, night_shift_percent,
                meal_voucher_amount
         FROM read_parquet({pq('dim_union')})
-        WHERE 1=1
-          {"AND state = '" + _GLOBAL_FILTERS['estado'] + "'" if _GLOBAL_FILTERS.get('estado') else ""}
-          {"AND name = '" + _GLOBAL_FILTERS['sindicato'] + "'" if _GLOBAL_FILTERS.get('sindicato') else ""}
-    """)
+        WHERE 1=1{cond}
+    """, params)
 def ccts_processadas():
+    params = []
+    cond = _col_conds(
+        params,
+        ("state", _GLOBAL_FILTERS.get('estado')),
+        ("name", _GLOBAL_FILTERS.get('sindicato')),
+    )
     return query(f"""
         SELECT name, state, company, standard_weekly_hours,
                cct_year_start, cct_year_end
         FROM read_parquet({pq('dim_union')})
-        WHERE 1=1
-          {"AND state = '" + _GLOBAL_FILTERS['estado'] + "'" if _GLOBAL_FILTERS.get('estado') else ""}
-          {"AND name = '" + _GLOBAL_FILTERS['sindicato'] + "'" if _GLOBAL_FILTERS.get('sindicato') else ""}
-    """)
+        WHERE 1=1{cond}
+    """, params)
 
 def regras_extraidas():
+    params = []
+    cond = _col_conds(
+        params,
+        ("u.state", _GLOBAL_FILTERS.get('estado')),
+        ("u.name", _GLOBAL_FILTERS.get('unidade')),
+        ("un.name", _GLOBAL_FILTERS.get('sindicato')),
+    )
     return query(f"""
         SELECT use_case AS regra_id, rule_name AS regra,
                severity AS nivel, category
@@ -698,15 +782,19 @@ def regras_extraidas():
         LEFT JOIN read_parquet({pq('dim_employee')}) e ON f.employee_id = e.employee_id
         LEFT JOIN read_parquet({pq('dim_unit')}) u ON e.unit_id = u.unit_id
         LEFT JOIN read_parquet({pq('dim_union')}) un ON e.union_id = un.union_id
-        WHERE 1=1
-          {"AND u.state = '" + _GLOBAL_FILTERS['estado'] + "'" if _GLOBAL_FILTERS.get('estado') else ""}
-          {"AND u.name = '" + _GLOBAL_FILTERS['unidade'] + "'" if _GLOBAL_FILTERS.get('unidade') else ""}
-          {"AND un.name = '" + _GLOBAL_FILTERS['sindicato'] + "'" if _GLOBAL_FILTERS.get('sindicato') else ""}
+        WHERE 1=1{cond}
         GROUP BY use_case, rule_name, severity, category
         ORDER BY use_case
-    """)
+    """, params)
 
 def status_geral():
+    params = []
+    cond = _col_conds(
+        params,
+        ("u.state", _GLOBAL_FILTERS.get('estado')),
+        ("u.name", _GLOBAL_FILTERS.get('unidade')),
+        ("un.name", _GLOBAL_FILTERS.get('sindicato')),
+    )
     return query(f"""
         SELECT CASE WHEN severity='critico' THEN 'Critico'
                     WHEN severity='alto' THEN 'Atencao'
@@ -716,17 +804,16 @@ def status_geral():
         LEFT JOIN read_parquet({pq('dim_employee')}) e ON f.employee_id = e.employee_id
         LEFT JOIN read_parquet({pq('dim_unit')}) u ON e.unit_id = u.unit_id
         LEFT JOIN read_parquet({pq('dim_union')}) un ON e.union_id = un.union_id
-        WHERE 1=1
-          {"AND u.state = '" + _GLOBAL_FILTERS['estado'] + "'" if _GLOBAL_FILTERS.get('estado') else ""}
-          {"AND u.name = '" + _GLOBAL_FILTERS['unidade'] + "'" if _GLOBAL_FILTERS.get('unidade') else ""}
-          {"AND un.name = '" + _GLOBAL_FILTERS['sindicato'] + "'" if _GLOBAL_FILTERS.get('sindicato') else ""}
+        WHERE 1=1{cond}
         GROUP BY severity ORDER BY severity
-    """)
+    """, params)
 
 # ---------------------------------------------------------------------------
 # Analitico - new data functions for dashboard_analitico
 # ---------------------------------------------------------------------------
 def window_alert_data():
+    params = []
+    cond = _col_conds(params, ("u.state", _GLOBAL_FILTERS.get('estado')))
     return query(f"""
         WITH vacations_by_state AS (
             SELECT u.state,
@@ -741,8 +828,7 @@ def window_alert_data():
             JOIN read_parquet({pq('dim_employee')}) e ON v.employee_id = e.employee_id
             JOIN read_parquet({pq('dim_unit')}) u ON e.unit_id = u.unit_id
             WHERE v.status IN ('pending', 'impending')
-              AND v.concession_deadline > CURRENT_DATE
-              {"AND u.state = '" + _GLOBAL_FILTERS['estado'] + "'" if _GLOBAL_FILTERS.get('estado') else ""}
+              AND v.concession_deadline > CURRENT_DATE{cond}
             GROUP BY u.state, janela
         ),
         totals AS (
@@ -755,31 +841,36 @@ def window_alert_data():
         FROM vacations_by_state vb
         JOIN totals t ON vb.state = t.state
         ORDER BY vb.state, vb.janela
-    """)
+    """, params)
 
 def payment_month_data():
+    params = []
+    cond_unit = _col_conds(
+        params,
+        ("u.state", _GLOBAL_FILTERS.get('estado')),
+        ("u.name", _GLOBAL_FILTERS.get('unidade')),
+        ("un.name", _GLOBAL_FILTERS.get('sindicato')),
+    )
+    cond_comp, comp_params = _filters_competence('m')
+    params.extend(comp_params)
     return query(f"""
         WITH monthly_employees AS (
             SELECT year, month,
                    CONCAT(CAST(year AS VARCHAR), '-', LPAD(CAST(month AS VARCHAR), 2, '0')) AS competence,
-                   COUNT(DISTINCT employee_id) AS employee_count
+                   COUNT(DISTINCT m.employee_id) AS employee_count
             FROM read_parquet({gq('fact_monthly_employee')}) m
             JOIN read_parquet({pq('dim_employee')}) e ON m.employee_id = e.employee_id
             JOIN read_parquet({pq('dim_unit')}) u ON e.unit_id = u.unit_id
             JOIN read_parquet({pq('dim_union')}) un ON e.union_id = un.union_id
-            WHERE 1=1
-              {"AND u.state = '" + _GLOBAL_FILTERS['estado'] + "'" if _GLOBAL_FILTERS.get('estado') else ""}
-              {"AND u.name = '" + _GLOBAL_FILTERS['unidade'] + "'" if _GLOBAL_FILTERS.get('unidade') else ""}
-              {"AND un.name = '" + _GLOBAL_FILTERS['sindicato'] + "'" if _GLOBAL_FILTERS.get('sindicato') else ""}
-              {_filters_competence('m')}
+            WHERE 1=1{cond_unit}{cond_comp}
             GROUP BY year, month
         ),
         monthly_passivo AS (
-            SELECT competence,
-                   COUNT(DISTINCT employee_id) AS affected_employees,
-                   ROUND(SUM(estimated_impact), 0) AS passivo_total
-            FROM read_parquet({gq('fact_passivo_trabalhista')})
-            GROUP BY competence
+            SELECT f.competence,
+                   COUNT(DISTINCT f.employee_id) AS affected_employees,
+                   ROUND(SUM(f.financial_impact), 0) AS passivo_total
+            FROM read_parquet({gq('fact_detected_inconsistency')}) f
+            GROUP BY f.competence
         )
         SELECT me.competence, me.year, me.month,
                me.employee_count,
@@ -789,9 +880,16 @@ def payment_month_data():
         LEFT JOIN monthly_passivo mp ON me.competence = mp.competence
         ORDER BY me.year, me.month
         LIMIT 12
-    """)
+    """, params)
 
 def jornada_donut_data():
+    params = []
+    cond = _col_conds(
+        params,
+        ("u.state", _GLOBAL_FILTERS.get('estado')),
+        ("u.name", _GLOBAL_FILTERS.get('unidade')),
+        ("un.name", _GLOBAL_FILTERS.get('sindicato')),
+    )
     return query(f"""
         WITH incompatible_ids AS (
             SELECT DISTINCT employee_id
@@ -804,10 +902,7 @@ def jornada_donut_data():
             JOIN read_parquet({pq('dim_unit')}) u ON e.unit_id = u.unit_id
             JOIN read_parquet({pq('dim_union')}) un ON e.union_id = un.union_id
             LEFT JOIN incompatible_ids i ON e.employee_id = i.employee_id
-            WHERE e.status = 'active' AND i.employee_id IS NULL
-              {"AND u.state = '" + _GLOBAL_FILTERS['estado'] + "'" if _GLOBAL_FILTERS.get('estado') else ""}
-              {"AND u.name = '" + _GLOBAL_FILTERS['unidade'] + "'" if _GLOBAL_FILTERS.get('unidade') else ""}
-              {"AND un.name = '" + _GLOBAL_FILTERS['sindicato'] + "'" if _GLOBAL_FILTERS.get('sindicato') else ""}
+            WHERE e.status = 'active' AND i.employee_id IS NULL{cond}
             GROUP BY e.work_schedule
         ),
         incompatible_count AS (
@@ -820,9 +915,15 @@ def jornada_donut_data():
                COALESCE((SELECT cnt FROM incompatible_count), 0) AS incompatible_cnt
         FROM schedule_counts sc
         ORDER BY sc.cnt DESC
-    """)
+    """, params)
 
 def compliance_table_data():
+    params = []
+    cond = _col_conds(
+        params,
+        ("un.state", _GLOBAL_FILTERS.get('estado')),
+        ("un.name", _GLOBAL_FILTERS.get('sindicato')),
+    )
     return query(f"""
         WITH employee_consistency AS (
             SELECT e.employee_id, e.union_id,
@@ -845,26 +946,28 @@ def compliance_table_data():
         FROM read_parquet({pq('dim_union')}) un
         LEFT JOIN employee_consistency ec ON un.union_id = ec.union_id
         LEFT JOIN read_parquet({gq('fact_passivo_trabalhista')}) fp ON ec.employee_id = fp.employee_id
-        WHERE 1=1
-          {"AND un.state = '" + _GLOBAL_FILTERS['estado'] + "'" if _GLOBAL_FILTERS.get('estado') else ""}
-          {"AND un.name = '" + _GLOBAL_FILTERS['sindicato'] + "'" if _GLOBAL_FILTERS.get('sindicato') else ""}
+        WHERE 1=1{cond}
         GROUP BY un.state, un.name, un.standard_weekly_hours, un.salary_adjustment_percent, un.base_salary_min
         ORDER BY passivo_total DESC
-    """)
+    """, params)
 
 def distribuicao_entidades():
     base = pq('dim_employee')
     pay = pq('fact_payroll')
+    params = []
+    cond = _col_conds(
+        params,
+        ("u.state", _GLOBAL_FILTERS.get('estado')),
+        ("u.name", _GLOBAL_FILTERS.get('unidade')),
+        ("un.name", _GLOBAL_FILTERS.get('sindicato')),
+    )
     return query(f"""
         WITH ebase AS (
             SELECT e.*
             FROM read_parquet({base}) e
             JOIN read_parquet({pq('dim_unit')}) u ON e.unit_id = u.unit_id
             JOIN read_parquet({pq('dim_union')}) un ON e.union_id = un.union_id
-            WHERE 1=1
-              {"AND u.state = '" + _GLOBAL_FILTERS['estado'] + "'" if _GLOBAL_FILTERS.get('estado') else ""}
-              {"AND u.name = '" + _GLOBAL_FILTERS['unidade'] + "'" if _GLOBAL_FILTERS.get('unidade') else ""}
-              {"AND un.name = '" + _GLOBAL_FILTERS['sindicato'] + "'" if _GLOBAL_FILTERS.get('sindicato') else ""}
+            WHERE 1=1{cond}
         )
         SELECT
             (SELECT count(*) FROM ebase WHERE status='active') AS total_ativos,
@@ -891,4 +994,4 @@ def distribuicao_entidades():
             (SELECT count(DISTINCT employee_id) FROM read_parquet({pay}) WHERE union_discount > 0) AS contrib_sindical,
 
             (SELECT count(*) FROM ebase WHERE status='active' AND gender='F') AS gestante
-    """)
+    """, params)

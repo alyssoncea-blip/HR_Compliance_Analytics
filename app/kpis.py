@@ -27,21 +27,23 @@ def register(name, category, unit, description):
 @register("passivo_total", "Financeiro", "BRL",
           "Somatorio do passivo trabalhista estimado a partir das inconsistencias detectadas")
 def metric_passivo_total():
+    where, params = _filters_employee('e', 'u', 'un')
     sql = f"""
         SELECT ROUND(SUM(estimated_impact), 0) AS value
         FROM read_parquet({gq('fact_passivo_trabalhista')}) fp
         JOIN read_parquet({pq('dim_employee')}) e ON fp.employee_id = e.employee_id
         JOIN read_parquet({pq('dim_unit')}) u ON e.unit_id = u.unit_id
         JOIN read_parquet({pq('dim_union')}) un ON e.union_id = un.union_id
-        {_filters_employee('e', 'u', 'un')}
+        {where}
     """
-    df = query(sql)
+    df = query(sql, params)
     return float(df.iloc[0]["value"]) if not df.empty and df.iloc[0]["value"] is not None else 0.0
 
 
 @register("conformidade_pct", "Qualidade", "%",
           "Percentual de competencias sem inconsistencias criticas")
 def metric_conformidade_pct():
+    where, params = _filters_employee('e', 'u', 'un')
     sql = f"""
         SELECT
             COUNT(DISTINCT CASE WHEN total_inconsistencies = 0 THEN competence END) * 100.0 /
@@ -50,9 +52,9 @@ def metric_conformidade_pct():
         JOIN read_parquet({pq('dim_employee')}) e ON m.employee_id = e.employee_id
         JOIN read_parquet({pq('dim_unit')}) u ON e.unit_id = u.unit_id
         JOIN read_parquet({pq('dim_union')}) un ON e.union_id = un.union_id
-        {_filters_employee('e', 'u', 'un')}
+        {where}
     """
-    df = query(sql)
+    df = query(sql, params)
     val = df.iloc[0]["value"]
     return round(float(val), 1) if not df.empty and val is not None else 100.0
 
@@ -83,6 +85,7 @@ def metric_equidade_salarial():
 @register("passivo_por_funcionario", "Financeiro", "BRL",
           "Passivo medio estimado por funcionario afetado")
 def metric_passivo_por_funcionario():
+    where, params = _filters_employee('e', 'u', 'un')
     sql = f"""
         SELECT
             COUNT(DISTINCT f.employee_id) AS affected,
@@ -91,9 +94,9 @@ def metric_passivo_por_funcionario():
         JOIN read_parquet({pq('dim_employee')}) e ON f.employee_id = e.employee_id
         JOIN read_parquet({pq('dim_unit')}) u ON e.unit_id = u.unit_id
         JOIN read_parquet({pq('dim_union')}) un ON e.union_id = un.union_id
-        {_filters_employee('e', 'u', 'un')}
+        {where}
     """
-    df = query(sql)
+    df = query(sql, params)
     total = df.iloc[0]["total"] if not df.empty and df.iloc[0]["total"] is not None else 0
     affected = df.iloc[0]["affected"] if not df.empty and df.iloc[0]["affected"] is not None else 1
     return round(total / max(affected, 1), 0)
@@ -102,6 +105,9 @@ def metric_passivo_por_funcionario():
 @register("he_media_mensal", "Operacao", "horas",
           "Media mensal de horas extras por funcionario")
 def metric_he_media_mensal():
+    where, params = _filters_employee('e', 'u', 'un')
+    comp_cond, comp_params = _filters_competence('m')
+    params = list(params) + list(comp_params)
     sql = f"""
         SELECT ROUND(AVG(
             COALESCE(total_overtime_50_hours, 0) +
@@ -112,10 +118,10 @@ def metric_he_media_mensal():
         JOIN read_parquet({pq('dim_employee')}) e ON m.employee_id = e.employee_id
         JOIN read_parquet({pq('dim_unit')}) u ON e.unit_id = u.unit_id
         JOIN read_parquet({pq('dim_union')}) un ON e.union_id = un.union_id
-        {_filters_employee('e', 'u', 'un')}
-          {_filters_competence('m')}
+        {where}
+          {comp_cond}
     """
-    df = query(sql)
+    df = query(sql, params)
     val = df.iloc[0]["value"]
     return float(val) if not df.empty and val is not None else 0.0
 
