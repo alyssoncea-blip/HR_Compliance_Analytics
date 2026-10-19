@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 jobs:
   lint-syntax:
@@ -24,7 +25,7 @@ jobs:
   pipeline:
     name: Full pipeline + tests
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -33,7 +34,63 @@ jobs:
           cache: pip
       - name: Install dependencies
         run: pip install -r requirements.txt
-      - name: Run full data pipeline
-        run: python pipelines/run_pipeline.py
+      - name: Cache bronze dataset (deterministic, SEED-keyed)
+        id: bronze-cache
+        uses: actions/cache@v4
+        with:
+          path: data/bronze
+          key: bronze-ubuntu-${{ hashFiles('pipelines/ingest/config.py') }}
+          restore-keys: |
+            bronze-ubuntu-
+      - name: Run data pipeline (skip ingest when bronze cache hit)
+        run: |
+          if [[ "${{ steps.bronze-cache.outputs.cache-hit }}" == "true" ]]; then
+            echo "Bronze cache hit (config unchanged) — running pipeline with --skip-ingest"
+            python pipelines/run_pipeline.py --skip-ingest
+          else
+            echo "No bronze cache — running full pipeline (including ingest)"
+            python pipelines/run_pipeline.py
+          fi
+      - name: Upload pipeline manifests as artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-manifests
+          path: |
+            data/gold/**/*manifest*.json
+            data/gold/governance/*.json
+          retention-days: 7
+          if-no-files-found: warn
       - name: Run test suite
         run: python -m pytest tests/ -v
+
+  gates:
+    name: Governance blocking gates
+    needs: pipeline
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Restore bronze dataset cache
+        uses: actions/cache@v4
+        with:
+          path: data/bronze
+          key: bronze-ubuntu-${{ hashFiles('pipelines/ingest/config.py') }}
+          restore-keys: |
+            bronze-ubuntu-
+      - name: Generate bronze if cache miss
+        run: |
+          if [ ! -f data/bronze/hr_system/employees.csv ]; then
+            echo "Bronze cache unavailable — generating synthetic data"
+            python pipelines/ingest/main.py
+          fi
+      - name: Rebuild silver → gold from cached bronze (no ingest)
+        run: python pipelines/run_pipeline.py --skip-ingest
+      - name: Run governance with blocking gates (fails the job on gate failure)
+        run: python pipelines/governance.py --fail-on-gate
