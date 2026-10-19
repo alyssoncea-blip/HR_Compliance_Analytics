@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 
 import pytest
 
@@ -103,7 +104,7 @@ def _run_harness(out_path, *extra):
 
 
 def test_harness_partitioned_run_valid_history(data_available):
-    out_path = os.environ["TEMP"] + os.sep + "engine_benchmark_it1.json"
+    out_path = os.path.join(tempfile.gettempdir(), "engine_benchmark_it1.json")
     if os.path.exists(out_path):
         os.remove(out_path)
     history = _run_harness(out_path, "--competence", TARGET)
@@ -130,7 +131,7 @@ def test_harness_partitioned_run_valid_history(data_available):
 
 
 def test_harness_history_appends(data_available):
-    out_path = os.environ["TEMP"] + os.sep + "engine_benchmark_it2.json"
+    out_path = os.path.join(tempfile.gettempdir(), "engine_benchmark_it2.json")
     if os.path.exists(out_path):
         os.remove(out_path)
     first = _run_harness(out_path, "--competence", TARGET)
