@@ -1,0 +1,9 @@
+# OCR fallback for scanned CCT PDFs (optional, not part of the core install)
+# Install: pip install -r requirements-ocr.txt
+# Also requires the tesseract engine binary on PATH (or in a standard location):
+#   Windows: winget install --id UB-Mannheim.TesseractOCR
+#   Linux:   apt-get install tesseract-ocr tesseract-ocr-por
+#   macOS:   brew install tesseract tesseract-lang
+# Portuguese traineddata ('por') is recommended for the RN/CAERN scanned ACTs.
+pytesseract>=0.3.10
+Pillow>=10.0
