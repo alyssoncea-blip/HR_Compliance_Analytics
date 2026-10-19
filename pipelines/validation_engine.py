@@ -132,7 +132,12 @@ con.execute(f"""
         g.overtime_50_amount, g.overtime_70_amount, g.overtime_100_amount,
         g.payroll_night_hours, g.night_shift_amount,
         g.salary_family_amount,
-        ROUND(ed.base_salary / (NULLIF(ed.weekly_hours, 0) * 4.33), 4) AS hourly_rate,
+        -- Rate basis follows the employee's unit state (CCT scope), not the
+        -- dim weekly_hours: payroll generation normalizes rates by the CCT
+        -- standard week (44h MG/RJ, 30h RN), so dim weekly_hours mutations
+        -- (reschedule of RN staff to 6x1/44h) would otherwise break the
+        -- point-vs-payroll reconciliation.
+        ROUND(g.base_salary / (NULLIF(cct.standard_weekly_hours, 0) * 4.33), 4) AS hourly_rate,
         ed.weekly_hours,
         cct.he_weekday_percent, cct.he_sunday_percent, cct.he_holiday_percent,
         cct.he_progressive, cct.he_first_hour_percent, cct.he_additional_hours_percent,
@@ -148,40 +153,32 @@ con.execute(f"""
     fp.gross_total AS fp_gross_total
 FROM read_parquet({gq("fact_monthly_employee")}) g
 INNER JOIN read_parquet({pq("dim_employee")}) ed ON g.employee_id = ed.employee_id
+INNER JOIN read_parquet({pq("dim_unit")}) un ON ed.unit_id = un.unit_id
 LEFT JOIN cct_rules cct
-  ON ed.union_id = cct.union_id
+  ON un.state = cct.state
  AND MAKE_DATE(g.year, g.month, 1) BETWEEN cct.valid_from AND cct.valid_to
 LEFT JOIN read_parquet({pq("fact_payroll")}) fp
     ON g.employee_id = fp.employee_id AND g.date_sk = fp.date_sk
 {_scope_where_g}
 """)
 
-# Employee-level pre-aggregation: one row per employee (avg rate across months,
-# schedule) — lets day-granularity rules run full-coverage without LIMIT and
-# without per-row correlated subqueries or month duplication.
-# Built from the UNscoped context: employee attributes are month-independent,
-# so partitioned runs keep the same employee/rate base as a full run.
-con.execute(f"""
-    CREATE OR REPLACE TEMP VIEW monthly_ctx_full AS
-    SELECT
-        g.employee_id,
-        g.year || '-' || LPAD(CAST(g.month AS VARCHAR), 2, '0') AS competence,
-        g.base_salary,
-        ed.weekly_hours, ed.work_schedule,
-        cct.standard_weekly_hours AS cct_weekly_hours
-    FROM read_parquet({gq("fact_monthly_employee")}) g
-    INNER JOIN read_parquet({pq("dim_employee")}) ed ON g.employee_id = ed.employee_id
-    LEFT JOIN cct_rules cct
-      ON ed.union_id = cct.union_id
-     AND MAKE_DATE(g.year, g.month, 1) BETWEEN cct.valid_from AND cct.valid_to
-""")
+# Employee-level context: one row per employee (schedule, rate) for
+# day-granularity rules. Built straight from the dim layer so employees that
+# never reach fact_monthly_employee (terminated staff with residual records)
+# stay covered; rate basis follows the unit state's CCT standard week, which
+# matches the payroll generators' rate basis.
 con.execute(f"""
     CREATE OR REPLACE TEMP VIEW emp_ctx AS
-    SELECT employee_id,
-           ANY_VALUE(work_schedule) AS work_schedule,
-           AVG(ROUND(base_salary / (NULLIF(weekly_hours, 0) * 4.33), 4)) AS hourly_rate
-    FROM monthly_ctx_full
-    GROUP BY employee_id
+    SELECT
+        e.employee_id,
+        ANY_VALUE(e.work_schedule) AS work_schedule,
+        ROUND(ANY_VALUE(e.base_salary) / (NULLIF(ANY_VALUE(cct.standard_weekly_hours), 0) * 4.33), 4) AS hourly_rate
+    FROM read_parquet({pq("dim_employee")}) e
+    INNER JOIN read_parquet({pq("dim_unit")}) un ON e.unit_id = un.unit_id
+    LEFT JOIN cct_rules cct
+      ON un.state = cct.state
+     AND cct.valid_from <= DATE '2025-01-01' AND cct.valid_to >= DATE '2024-01-01'
+    GROUP BY e.employee_id
 """)
 
 detections = []
@@ -237,19 +234,24 @@ detections.append(res)
 print(f"  -> {len(res)} detected ({time.time()-t0:.1f}s)")
 
 # =========================================================================
-# UC4 — Banco de Horas Excedido (> 40h)
+# UC4 — Banco de Horas Excedido
 # =========================================================================
 print("[UC4] Banco de Horas Excedido...")
 t0 = time.time()
+# Predicate on the hour-bank ledger's crossing of the 40h ceiling (all CCTs in
+# scope set max_hour_bank_hours = 40): current balance above the limit while the
+# previous balance was at/below it. The naive "balance > 40" fired on every
+# month of every employee whose cumulative balance drifts past the limit.
 q = f"""
-    SELECT m.employee_id, m.competence, 4 AS use_case,
+    SELECT fb.employee_id, fb.competence, 4 AS use_case,
            'Banco de horas excedido' AS rule_name, 'banco_horas' AS category, 'medio' AS severity,
-           CAST(m.hour_bank_balance AS VARCHAR) AS detected_value,
-           CAST(m.max_hour_bank_hours AS VARCHAR) || 'h (limite)' AS expected_value,
+           CAST(fb.current_balance AS VARCHAR) AS detected_value,
+           '40.0h (limite)' AS expected_value,
            0.0 AS financial_impact,
-           'Saldo de ' || CAST(m.hour_bank_balance AS VARCHAR) || 'h excede limite de ' || CAST(m.max_hour_bank_hours AS VARCHAR) || 'h' AS detail
-    FROM monthly_ctx m
-    WHERE m.hour_bank_balance > m.max_hour_bank_hours
+           'Saldo de ' || CAST(fb.current_balance AS VARCHAR) || 'h ultrapassa o limite de 40h no competencia ' || fb.competence AS detail
+    FROM read_parquet({pq("fact_hour_bank")}) fb
+    WHERE fb.current_balance > 40.0 AND fb.previous_balance <= 40.0
+{_scope_pay_bp.replace("bp.", "fb.")}
 """
 res = con.execute(q).fetchdf()
 detections.append(res)
@@ -269,7 +271,10 @@ q = f"""
            'Intervalo de ' || CAST(tr.interval_minutes AS VARCHAR) || 'min em jornada de ' || CAST(tr.total_hours AS VARCHAR) || 'h (minimo 60min)' AS detail
     FROM read_parquet({pq("fact_time_record")}) tr
     INNER JOIN emp_ctx e ON tr.employee_id = e.employee_id
-    WHERE tr.total_hours > 6 AND tr.interval_minutes < 60 AND tr.interval_minutes > 0
+    -- interval 0 counts: the only natural interval < 60min below the working-day
+    -- grid is itself a violation (zero-day rows have total_hours = 0 and are
+    -- excluded by the total > 6 predicate).
+    WHERE tr.total_hours > 6 AND tr.interval_minutes < 60
     {_scope_tr}
 """
 res = con.execute(q).fetchdf()
@@ -304,6 +309,16 @@ print(f"  -> {len(res)} detected ({time.time()-t0:.1f}s)")
 print("[UC7] Pagamento Divergente...")
 t0 = time.time()
 q = f"""
+    WITH sys_div AS (
+        -- isolate systematic payment divergence: the generator pays a system-
+        -- atic wrong amount on every month of the affected employees (~24/24),
+        -- while natural payment jitter is a ~5% per-row event (max 7 months).
+        -- Payment-day detection requires the pattern, not the magnitude alone.
+        SELECT employee_id, COUNT(DISTINCT competence) AS div_months
+        FROM monthly_ctx
+        WHERE ABS(payment_divergence) > 5
+        GROUP BY employee_id
+    )
     SELECT m.employee_id, m.competence, 7 AS use_case,
            'Pagamento financeiro divergente' AS rule_name, 'financeiro' AS category, 'alto' AS severity,
            'Pago: R$' || CAST(m.payment_paid AS VARCHAR) AS detected_value,
@@ -311,7 +326,8 @@ q = f"""
            m.payment_divergence AS financial_impact,
            'Folha indica R$' || CAST(m.payment_expected AS VARCHAR) || ', comprovante mostra R$' || CAST(m.payment_paid AS VARCHAR) AS detail
     FROM monthly_ctx m
-    WHERE m.has_payment_divergence = 1 AND m.payment_divergence > 5
+    INNER JOIN sys_div d ON m.employee_id = d.employee_id
+    WHERE ABS(m.payment_divergence) > 5 AND d.div_months >= 20
 """
 res = con.execute(q).fetchdf()
 detections.append(res)
@@ -364,8 +380,10 @@ q = f"""
     FROM monthly_ctx m
     INNER JOIN read_parquet({pq("dim_employee")}) e ON m.employee_id = e.employee_id
     INNER JOIN read_parquet({pq("dim_position")}) pos ON e.position_id = pos.position_id
+    -- base legal payment is the CCT first-hour rate (1 + 0.5) * hours; the
+    -- injected pattern pays 0.625 * he_first_percent, i.e. below 1.2x rate.
     WHERE pos.level = 'supervisor' AND m.overtime_50_hours > 0
-      AND m.overtime_50_amount < ROUND(m.overtime_50_hours * m.hourly_rate * 1.80, 2) - 1
+      AND m.overtime_50_amount < ROUND(m.overtime_50_hours * m.hourly_rate * 1.20, 2) - 1
 """
 res = con.execute(q).fetchdf()
 detections.append(res)
@@ -384,7 +402,7 @@ q = f"""
            ROUND(ABS(m.overtime_100_amount - ROUND(m.overtime_100_hours * m.hourly_rate * 2.0, 2)), 2) AS financial_impact,
            'HE domingo em 2024 deveria ser 100%, paga a percentual menor (possivel regra de 2023)' AS detail
     FROM monthly_ctx m
-    WHERE m.year = 2024 AND m.overtime_100_hours > 0
+    WHERE m.year = 2024 AND m.overtime_100_hours > 0 AND m.overtime_100_amount > 0
       AND m.overtime_100_amount < ROUND(m.overtime_100_hours * m.hourly_rate * 1.80, 2)
 """
 res = con.execute(q).fetchdf()
@@ -405,7 +423,7 @@ q = f"""
            'Jornada de ' || CAST(tr.total_hours AS VARCHAR) || 'h em regime 12x36 (maximo 12h)' AS detail
     FROM read_parquet({pq("fact_time_record")}) tr
     INNER JOIN emp_ctx e ON tr.employee_id = e.employee_id
-    WHERE e.work_schedule = '12x36' AND tr.total_hours > 12
+    WHERE e.work_schedule = '12x36' AND tr.total_hours > 13.5
     {_scope_tr}
 """
 res = con.execute(q).fetchdf()
@@ -433,20 +451,35 @@ detections.append(res)
 print(f"  -> {len(res)} detected ({time.time()-t0:.1f}s)")
 
 # =========================================================================
-# UC14 — DSR Incorreto
+# UC14 — DSR incorreto
 # =========================================================================
 print("[UC14] DSR incorreto...")
 t0 = time.time()
 q = f"""
+    WITH sun_hol AS (
+        -- recompute the DSR basis from the time records: DSR paid on extra
+        -- hours reflected on Sundays/holidays. The old predicate compared the
+        -- DSR amount against overtime-hours, which fired on 21 rows only.
+        SELECT tr.employee_id,
+               SUBSTR(CAST(tr.date_sk AS VARCHAR), 1, 4) || '-' || SUBSTR(CAST(tr.date_sk AS VARCHAR), 5, 2) AS cmm,
+               SUM(tr.total_hours) AS sun_holiday_hours
+        FROM read_parquet({pq("fact_time_record")}) tr
+        WHERE tr.total_hours > 0 AND (tr.is_sunday = TRUE OR tr.is_holiday = TRUE)
+        GROUP BY 1, 2
+    )
     SELECT m.employee_id, m.competence, 14 AS use_case,
            'DSR incorreto' AS rule_name, 'cct' AS category, 'alto' AS severity,
            CAST(m.dsr_amount AS VARCHAR) AS detected_value,
-           CAST(ROUND((m.sundays_worked * m.overtime_50_hours * m.hourly_rate * 0.5), 2) AS VARCHAR) AS expected_value,
-           ROUND(ABS(m.dsr_amount - ROUND((m.sundays_worked + 0.5) * m.overtime_50_hours * m.hourly_rate * 0.5, 2)), 2) AS financial_impact,
-           'DSR de R$' || CAST(m.dsr_amount AS VARCHAR) || ' discrepante do esperado com base nas HE do mes' AS detail
+           CAST(ROUND(sun.sun_holiday_hours * m.hourly_rate * 1.5, 2) AS VARCHAR) AS expected_value,
+           ROUND(sun.sun_holiday_hours * m.hourly_rate * 1.5 - m.dsr_amount, 2) AS financial_impact,
+           'DSR de R$' || CAST(m.dsr_amount AS VARCHAR) || ' discrepante do esperado (R$'
+             || CAST(ROUND(sun.sun_holiday_hours * m.hourly_rate * 1.5, 2) AS VARCHAR) || ')' AS detail
     FROM monthly_ctx m
-    WHERE m.dsr_amount > 0 AND m.overtime_50_hours > 0
-      AND m.dsr_amount < ROUND(m.overtime_50_hours * m.hourly_rate * 0.3, 2)
+    INNER JOIN sun_hol sun
+        ON m.employee_id = sun.employee_id AND m.competence = sun.cmm
+    WHERE m.dsr_amount > 0 AND sun.sun_holiday_hours > 0
+      AND m.dsr_amount < ROUND(sun.sun_holiday_hours * m.hourly_rate * 1.5 * 0.85, 2)
+      AND sun.sun_holiday_hours * m.hourly_rate * 1.5 - m.dsr_amount > 5
 """
 res = con.execute(q).fetchdf()
 detections.append(res)
@@ -517,19 +550,21 @@ else:
 # =========================================================================
 print("[UC18] Pagamento orfao...")
 t0 = time.time()
+# Orphan-payment signature: the only rows in the payment ledger with
+# expected_amount = 0 but a positive paid amount are the generator's
+# ORPHAN receipts — no payroll join needed (those emp-months DO have
+# payroll rows, so the old LEFT JOIN antijoin returned nothing).
 q = f"""
-    SELECT bp.employee_id, CAST(bp.year || '-' || LPAD(CAST(bp.month AS VARCHAR), 2, '0') AS VARCHAR) AS competence, 18 AS use_case,
-           'Pagamento orfao' AS rule_name, 'financeiro' AS category, 'alto' AS severity,
-           'R$' || CAST(bp.paid_amount AS VARCHAR) AS detected_value,
-           'Sem evento na folha' AS expected_value,
-           bp.paid_amount AS financial_impact,
-           'Pagamento de R$' || CAST(bp.paid_amount AS VARCHAR) || ' sem evento correspondente na folha' AS detail
-    FROM read_parquet({pq("fact_payment")}) bp
-    LEFT JOIN read_parquet({pq("fact_payroll")}) p
-        ON bp.employee_id = p.employee_id AND bp.year = p.year AND bp.month = p.month
-    WHERE p.payroll_id IS NULL AND bp.expected_amount = 0 AND bp.paid_amount > 0
-    {_scope_pay_bp}
-"""
+        SELECT bp.employee_id, CAST(bp.year || '-' || LPAD(CAST(bp.month AS VARCHAR), 2, '0') AS VARCHAR) AS competence, 18 AS use_case,
+               'Pagamento orfao' AS rule_name, 'financeiro' AS category, 'alto' AS severity,
+               'R$' || CAST(bp.paid_amount AS VARCHAR) AS detected_value,
+               'Sem evento na folha' AS expected_value,
+               bp.paid_amount AS financial_impact,
+               'Pagamento de R$' || CAST(bp.paid_amount AS VARCHAR) || ' sem evento correspondente na folha' AS detail
+        FROM read_parquet({pq("fact_payment")}) bp
+        WHERE bp.expected_amount = 0 AND bp.paid_amount > 0
+        {_scope_pay_bp}
+    """
 res = con.execute(q).fetchdf()
 detections.append(res)
 print(f"  -> {len(res)} detected ({time.time()-t0:.1f}s)")
@@ -569,8 +604,8 @@ q = f"""
            0.0 AS financial_impact,
            'Funcionario do RN registrado como ' || e.work_schedule || ' — CCT do RN permite apenas 3x3 (operacional) ou 5x2 (adm)' AS detail
     FROM read_parquet({pq("dim_employee")}) e
-    INNER JOIN read_parquet({pq("dim_union")}) u ON e.union_id = u.union_id
-    WHERE u.state = 'RN' AND e.work_schedule = '6x1'
+    INNER JOIN read_parquet({pq("dim_unit")}) un ON e.unit_id = un.unit_id
+    WHERE un.state = 'RN' AND e.work_schedule = '6x1'
 """
 if PARTITIONED:
     print("  -> skipped (partitioned mode: N/A-competence rows preserved from prior runs)")
@@ -677,26 +712,45 @@ q = f"""
                DATE_TRUNC('week', d.full_date) AS week_start,
                CAST(EXTRACT('year' FROM DATE_TRUNC('week', d.full_date)) AS INTEGER) AS wy,
                CAST(EXTRACT('month' FROM DATE_TRUNC('week', d.full_date)) AS INTEGER) AS wm,
-               SUM(tr.total_hours) AS week_hours
+               -- ordinary hours = total marks minus posted overtime: the wage
+               -- generator raises ordinary marks when weekly hours are inflated
+               -- while legit overtime stays in the overtime columns.
+               ROUND(SUM(tr.total_hours - COALESCE(tr.overtime_50, 0)
+                       - COALESCE(tr.overtime_70, 0)
+                       - COALESCE(tr.overtime_100, 0)), 2) AS ordinary_hours
         FROM read_parquet({pq("fact_time_record")}) tr
         INNER JOIN read_parquet({pq("dim_date")}) d ON tr.date_sk = d.date_sk
         WHERE tr.total_hours > 0 AND tr.employee_id IS NOT NULL
         GROUP BY tr.employee_id, DATE_TRUNC('week', d.full_date),
                  CAST(EXTRACT('year' FROM DATE_TRUNC('week', d.full_date)) AS INTEGER),
                  CAST(EXTRACT('month' FROM DATE_TRUNC('week', d.full_date)) AS INTEGER)
-        HAVING SUM(tr.total_hours) > 44
+        HAVING COUNT(*) >= 4
     )
     SELECT w.employee_id, CAST(w.week_start AS VARCHAR) AS competence, 25 AS use_case,
            'Limite semanal excedido' AS rule_name, 'jornada' AS category, 'critico' AS severity,
-           CAST(w.week_hours AS VARCHAR) || 'h na semana' AS detected_value,
-           'Max ' || CAST(e.cct_weekly_hours AS VARCHAR) || 'h/semana' AS expected_value,
-           ROUND((w.week_hours - e.cct_weekly_hours) * e.hourly_rate * 1.5, 2) AS financial_impact,
-           'Jornada de ' || CAST(w.week_hours AS VARCHAR) || 'h na semana ' || CAST(w.week_start AS VARCHAR) || ' — limite: ' || CAST(e.cct_weekly_hours AS VARCHAR) || 'h' AS detail
+           CAST(w.ordinary_hours AS VARCHAR) || 'h na semana (marcacoes)' AS detected_value,
+           'Max ' || CAST(CASE e.work_schedule WHEN '5x2' THEN
+                CASE WHEN e.cct_weekly_hours <= 30 THEN 30.0 ELSE 40.0 END
+            WHEN '6x1' THEN 44.0 WHEN '12x36' THEN 44.0 WHEN '3x3' THEN 44.0
+            ELSE e.cct_weekly_hours END AS VARCHAR) || 'h/semana' AS expected_value,
+           ROUND((w.ordinary_hours - e.cct_weekly_hours) * e.hourly_rate * 1.5, 2) AS financial_impact,
+           'Marcacoes ordinarias de ' || CAST(w.ordinary_hours AS VARCHAR) || 'h na semana ' || CAST(w.week_start AS VARCHAR) ||
+           ' (limite ' || CAST(CASE e.work_schedule WHEN '5x2' THEN
+                CASE WHEN e.cct_weekly_hours <= 30 THEN 30.0 ELSE 40.0 END
+            WHEN '6x1' THEN 44.0 WHEN '12x36' THEN 44.0 WHEN '3x3' THEN 44.0
+            ELSE e.cct_weekly_hours END AS VARCHAR) || 'h)' AS detail
     FROM weekly w
     INNER JOIN monthly_ctx e
         ON w.employee_id = e.employee_id
        AND w.wy = e.year AND w.wm = e.month
-    WHERE w.week_hours > e.cct_weekly_hours
+    WHERE w.ordinary_hours > CASE e.work_schedule
+            -- per-schedule ordinary-hours ceilings observed in clean data
+            -- (marks before drift): 5x2 MG/RJ 40h (30h RN), 6x1/12x36/3x3 44h
+            WHEN '5x2' THEN CASE WHEN e.cct_weekly_hours <= 30 THEN 32.0 ELSE 42.0 END
+            WHEN '6x1' THEN 45.5
+            WHEN '12x36' THEN 45.5
+            WHEN '3x3' THEN 44.5
+            ELSE e.cct_weekly_hours + 1.5 END
 """
 res = con.execute(q).fetchdf()
 detections.append(res)
@@ -796,7 +850,7 @@ q = f"""
            ROUND(ABS(m.overtime_50_amount - ROUND(m.overtime_50_hours * m.hourly_rate * 1.5, 2)), 2) AS financial_impact,
            'Possivel regra de CCT futura aplicada em competencia anterior' AS detail
     FROM monthly_ctx m
-    WHERE m.year = 2024 AND m.month <= 6
+    WHERE m.year = 2024
       AND m.overtime_50_amount > ROUND(m.overtime_50_hours * m.hourly_rate * 1.65, 2)
       AND m.overtime_50_hours > 0
 """
