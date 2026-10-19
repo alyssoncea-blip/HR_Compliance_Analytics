@@ -8,5 +8,19 @@
     {"id": "validade_990", "mode": "blocking", "dimension": "validade", "threshold_pct": 99.0},
     {"id": "regra_negocio_informational", "mode": "informational", "dimension": "regra_negocio"},
     {"id": "fact_payroll_fk_strict", "mode": "blocking", "table": "silver.fact_payroll", "dimension": "integ_ref", "threshold_pct": 99.9}
-  ]
+  ],
+  "trend": {
+    "mode": "blocking",
+    "critical_severities": ["critical"],
+    "fail_on_critical_regressions": 1,
+    "warn_on_regressions": 3
+  },
+  "freshness": {
+    "mode": "warn_only",
+    "layers": {
+      "bronze": {"warn_hours": 48, "fail_hours": 168},
+      "silver": {"warn_hours": 72, "fail_hours": 336},
+      "gold": {"warn_hours": 168, "fail_hours": 720}
+    }
+  }
 }
