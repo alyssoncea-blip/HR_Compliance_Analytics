@@ -1,11 +1,33 @@
 """
 Data Quality & Governance Pipeline
 Runs quality checks across Bronze/Silver/Gold, builds data catalog,
-and documents lineage. Writes to data/gold/governance/.
+documents lineage, and evaluates configurable quality gates.
+Writes to data/gold/governance/.
+
+CLI: python pipelines/governance.py [--fail-on-gate]
+Without --fail-on-gate, blocking gate failures are logged + alerted but the
+process still exits 0. With the flag, exit code 1 on any blocking gate failure.
 """
-import duckdb, os, json, time, hashlib
+import duckdb, os, json, time, hashlib, sys, argparse
 from datetime import datetime, timezone
 from collections import defaultdict
+
+
+def parse_cli():
+    p = argparse.ArgumentParser(description="Data quality & governance pipeline")
+    p.add_argument("--fail-on-gate", action="store_true",
+                   help="Exit with code 1 when a blocking quality gate fails")
+    return p.parse_args()
+
+
+CLI = parse_cli()
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+from quality.gates import resolve_gates, load_gates_config, DEFAULT_CONFIG  # noqa: E402
+
+GATES_CONFIG_PATH = os.path.join(_HERE, "quality", "gates.json")
 
 SILVER = "data/silver"
 BRONZE = "data/bronze"
@@ -68,7 +90,7 @@ print("=" * 60)
 # =========================================================================
 # 1. DATA QUALITY CHECKS
 # =========================================================================
-print("\n[1/3] Running data quality checks...")
+print("\n[1/4] Running data quality checks...")
 
 quality_results = []
 
@@ -300,6 +322,33 @@ with open(path_q, "w", encoding="utf-8") as f:
     }, f, indent=2, ensure_ascii=False)
 print(f"  Results: {path_q}")
 
+# =========================================================================
+# 2. QUALITY GATES (configurable blocking/WARN/informational thresholds)
+# Gate resolution is pure logic in pipelines/quality/gates.py.
+# =========================================================================
+print("\n[2/4] Evaluating quality gates...")
+
+try:
+    gates_config = load_gates_config(GATES_CONFIG_PATH)
+    gates_config_source = "pipelines/quality/gates.json"
+except Exception as e:
+    print(f"  WARN: could not load {GATES_CONFIG_PATH} ({str(e)[:80]}); using builtin default config")
+    gates_config = DEFAULT_CONFIG
+    gates_config_source = "builtin_default"
+
+gate_verdict = resolve_gates(quality_results, gates_config)
+gate_verdict["run_at"] = NOW_ISO
+gate_verdict["config_source"] = gates_config_source
+
+path_gates = f"{GOV}/quality_gates.json"
+with open(path_gates, "w", encoding="utf-8") as f:
+    json.dump(gate_verdict, f, indent=2, ensure_ascii=False)
+print(f"  Gates verdict: {gate_verdict['overall_status']}")
+for g in gate_verdict["gates"]:
+    pct = "-" if g["pass_pct"] is None else g["pass_pct"]
+    print(f"    {str(g['id']):32s} {g['status']:14s} pass_pct={pct} matches={g['matched_checks']}")
+print(f"  Gates output: {path_gates}")
+
 # Observability event and SLA evaluation
 failed_critical = len([r for r in quality_results if r["status"] in ("FAIL", "ERROR") and r["severity"] in ("critical", "high")])
 obs_event = {
@@ -308,7 +357,13 @@ obs_event = {
     "checks_executed": total_checks,
     "failed_critical_or_high": failed_critical,
     "avg_score": None,
-    "sla": {"max_failed_critical_or_high": 10},
+    "sla": {"max_failed_critical_or_high": 10, "max_blocking_gate_failures": 0},
+    "quality_gates": {
+        "overall_status": gate_verdict["overall_status"],
+        "blocking_gate_failures": gate_verdict["blocking_gate_failures"],
+        "warned_gates": gate_verdict["warned_gates"],
+        "informational_gate_findings": gate_verdict["informational_gate_findings"],
+    },
 }
 
 # Print summary
@@ -321,7 +376,7 @@ for tbl in sorted(scores):
 # =========================================================================
 # 3. DATA CATALOG
 # =========================================================================
-print("\n[2/3] Building data catalog...")
+print("\n[3/4] Building data catalog...")
 
 catalog = {
     "project": "HR Compliance Analytics",
@@ -453,7 +508,7 @@ print(f"  Catalog: {path_cat}")
 # =========================================================================
 # 4. DATA LINEAGE
 # =========================================================================
-print("\n[3/3] Building data lineage...")
+print("\n[4/4] Building data lineage...")
 
 lineage = {
     "pipeline": "data_lineage",
@@ -537,6 +592,7 @@ governance_manifest = {
     "run_at": NOW_ISO,
     "outputs": {
         "data_quality": "data/gold/governance/data_quality_results.json",
+        "quality_gates": "data/gold/governance/quality_gates.json",
         "data_catalog": "data/gold/governance/data_catalog.json",
         "data_lineage": "data/gold/governance/data_lineage.json",
     },
@@ -544,6 +600,9 @@ governance_manifest = {
         "total_checks": total_checks,
         "tables_checked": len(scores),
         "avg_score": round(sum(s["pass"]/max(s["total"],1)*100 for s in scores.values())/max(len(scores),1), 1),
+        "gates_overall_status": gate_verdict["overall_status"],
+        "blocking_gate_failures": len(gate_verdict["blocking_gate_failures"]),
+        "gates_config_source": gates_config_source,
     },
 }
 obs_event["avg_score"] = governance_manifest["quality_summary"]["avg_score"]
@@ -560,6 +619,9 @@ with open(history_path, "w", encoding="utf-8") as f:
 if obs_event["sla_status"] == "FAIL":
     with open(f"{OBS}/alerts.log", "a", encoding="utf-8") as f:
         f.write(f"{NOW_ISO} | governance | SLA_FAIL | failed_critical_or_high={failed_critical}\n")
+if gate_verdict["blocking_gate_failures"]:
+    with open(f"{OBS}/alerts.log", "a", encoding="utf-8") as f:
+        f.write(f"{NOW_ISO} | governance | GATE_FAIL | overall={gate_verdict['overall_status']} | gates={','.join(gate_verdict['blocking_gate_failures'])}\n")
 
 path_man = f"{GOV}/governance_manifest.json"
 with open(path_man, "w", encoding="utf-8") as f:
@@ -573,7 +635,15 @@ print("GOVERNANCE SUMMARY")
 print(f"{'='*60}")
 print(f"  Quality checks: {total_checks} across {len(scores)} tables")
 print(f"  Average quality score: {governance_manifest['quality_summary']['avg_score']}%")
+print(f"  Quality gates: {gate_verdict['overall_status']} (blocking failures: {len(gate_verdict['blocking_gate_failures'])})")
+if gate_verdict["informational_gate_findings"]:
+    print(f"  Informational findings (non-blocking): {', '.join(gate_verdict['informational_gate_findings'])}")
 print(f"  Catalog entries: {sum(len(v['tables']) for v in catalog['layers'].values())} tables")
 print(f"  Lineage flows: {len(lineage['flows'])}")
 print(f"  Output: {GOV}/")
+
+if CLI.fail_on_gate and gate_verdict["overall_status"] == "FAIL":
+    print(f"FAIL: blocking quality gate(s) failed: {', '.join(gate_verdict['blocking_gate_failures'])}")
+    con.close()
+    sys.exit(1)
 print("\nDone.")

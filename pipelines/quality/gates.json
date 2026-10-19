@@ -1,0 +1,12 @@
+{
+  "warn_margin_pct": 0.5,
+  "gates": [
+    {"id": "completude_990", "mode": "blocking", "dimension": "completude", "threshold_pct": 99.0},
+    {"id": "unicidade_100", "mode": "blocking", "dimension": "unicidade", "threshold_pct": 100.0},
+    {"id": "integ_ref_995", "mode": "blocking", "dimension": "integ_ref", "threshold_pct": 99.5},
+    {"id": "consistencia_950", "mode": "blocking", "dimension": "consistencia", "threshold_pct": 95.0},
+    {"id": "validade_990", "mode": "blocking", "dimension": "validade", "threshold_pct": 99.0},
+    {"id": "regra_negocio_informational", "mode": "informational", "dimension": "regra_negocio"},
+    {"id": "fact_payroll_fk_strict", "mode": "blocking", "table": "silver.fact_payroll", "dimension": "integ_ref", "threshold_pct": 99.9}
+  ]
+}
