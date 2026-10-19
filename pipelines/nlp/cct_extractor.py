@@ -17,8 +17,10 @@ Output:
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import re
+import shutil
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,6 +48,18 @@ try:
     from pypdf import PdfReader
 except ImportError:  # pragma: no cover - dependency guard
     PdfReader = None
+
+# OCR is an *optional* fallback for scanned PDFs (no text layer). Both
+# pytesseract (+ Pillow) and the tesseract binary are deliberately imported
+# lazily inside detection/extraction helpers: if anything is missing the
+# extractor degrades gracefully with ``ocr_available: false`` instead of
+# failing the whole run.
+TESSERACT_FALLBACK_BINARIES = (
+    "C:/Program Files/Tesseract-OCR/tesseract.exe",  # UB-Mannheim Windows installer
+    "/usr/bin/tesseract",
+    "/opt/homebrew/bin/tesseract",
+    "/usr/local/bin/tesseract",
+)
 
 # Readability heuristic: a PDF counts as readable when at least 50% of its
 # pages yield more than 50 characters of text and the document has >= 500
@@ -185,6 +199,88 @@ def pdf_readability(page_texts: list[str]) -> tuple[bool, int, float]:
     share = (text_pages / len(page_texts)) if page_texts else 0.0
     readable = share >= READABLE_PAGE_SHARE and total_chars >= MIN_TOTAL_CHARS
     return readable, total_chars, share
+
+
+# ---------------------------------------------------------------------------
+# Optional OCR fallback (scanned PDFs without a text layer)
+# ---------------------------------------------------------------------------
+def detect_ocr_environment() -> tuple[bool, str, str]:
+    """Lazy OCR availability probe. Returns (available, note, tesseract_binary).
+
+    Only ``pytesseract`` is imported here; the tesseract engine itself is a
+    system binary located via PATH (plus well-known install locations).
+    Degrades gracefully instead of raising.
+    """
+    try:
+        import pytesseract  # noqa: F401
+    except ImportError:
+        return False, ("pytesseract not installed (optional dependency; "
+                       "pip install -r requirements-ocr.txt)"), ""
+    try:
+        import PIL  # noqa: F401
+    except ImportError:
+        return False, ("Pillow not installed (optional dependency; "
+                       "pip install -r requirements-ocr.txt)"), ""
+    binary = shutil.which("tesseract")
+    if binary is None:
+        for candidate in TESSERACT_FALLBACK_BINARIES:
+            if Path(candidate).exists():
+                binary = candidate
+                break
+    if binary is None:
+        return False, ("pytesseract installed but the tesseract binary was not "
+                       "found on PATH"), ""
+    return True, "", binary
+
+
+def resolve_ocr_language(binary: str) -> str:
+    """Prefer the 'por' traineddata when available, otherwise 'eng'.
+
+    Deterministic: resolves against ``binary`` explicitly and the
+    ``TESSDATA_PREFIX`` environment variable the engine itself honours.
+    """
+    import pytesseract
+    pytesseract.pytesseract.tesseract_cmd = binary
+    try:
+        languages = pytesseract.get_languages(config="")
+    except Exception:
+        return "eng"
+    return "por" if "por" in languages else "eng"
+
+
+def ocr_pdf_page_texts(pdf_path: Path, binary: str, language: str) -> tuple[list[str], dict]:
+    """OCR the embedded page images of a scanned PDF via tesseract.
+
+    Requires pytesseract + Pillow. Returns per-page OCR text (pages whose
+    images fail get an empty string) and the images actually OCR'd.
+
+    Honesty rules:
+      * a page without an embedded raster image yields '' (pypdf cannot render
+        vector PDFs to pixels);
+      * if a PDF exposes no images at all, text coercion is impossible and the
+        caller must report the OCR as ineffective rather than fabricate a pass.
+    """
+    import pytesseract
+    from PIL import Image
+    pytesseract.pytesseract.tesseract_cmd = binary
+    reader = PdfReader(str(pdf_path))
+    page_texts: list[str] = []
+    images_ocrd = 0
+    for page in reader.pages:
+        page_text = ""
+        images = list(page.images)
+        for image_obj in images:
+            try:
+                image = Image.open(io.BytesIO(image_obj.data))
+                text = pytesseract.image_to_string(image, lang=language)
+            except Exception:
+                text = ""
+            page_text += text + "\n"
+            if text.strip():
+                images_ocrd += 1
+        page_texts.append(page_text)
+    meta = {"images_ocrd": images_ocrd}
+    return page_texts, meta
 
 
 def parse_pdf_path(pdf_path: Path) -> dict:
@@ -360,42 +456,17 @@ def split_clauses(full_text: str, headers: list[dict]) -> list[dict]:
     return segments
 
 
-def extract_clauses_from_pdf(pdf_path: Path) -> dict:
-    """Full local pipeline for one PDF: readability, splitting, classification."""
-    meta = parse_pdf_path(pdf_path)
-    source_info = {
-        **meta,
-        "pages": 0,
-        "total_text_chars": 0,
-        "readable_page_share": 0.0,
-        "source_readable": False,
-        "clause_count": 0,
-    }
-    clauses: list[dict] = []
-    if PdfReader is None:
-        return {"meta": meta, "source_info": source_info, "clauses": [], "percent_counts": {}, "weekly_hours": []}
+def classify_document_segments(full_text: str, meta: dict, offsets: list[int]) -> tuple[list[dict], dict, set[int]]:
+    """Split clause segments out of ``full_text`` and classify each segment.
 
-    try:
-        page_texts = extract_pdf_texts(pdf_path)
-    except Exception:  # unreadable/corrupted file: keep honest, do not crash
-        return {"meta": meta, "source_info": source_info, "clauses": [], "percent_counts": {}, "weekly_hours": []}
-
-    readable, total_chars, share = pdf_readability(page_texts)
-    source_info.update({
-        "pages": len(page_texts),
-        "total_text_chars": total_chars,
-        "readable_page_share": round(share, 3),
-        "source_readable": readable,
-    })
-    if not readable:
-        return {"meta": meta, "source_info": source_info, "clauses": [], "percent_counts": {}, "weekly_hours": []}
-
-    full_text, offsets = build_page_offsets(page_texts)
+    Returns (clauses, percent_totals, weekly_hours_set).
+    """
     headers = locate_clause_headers(full_text)
     segments = split_clauses(full_text, headers)
 
     percent_totals = {"50": 0, "70": 0, "100": 0}
     doc_weekly_hours: set[int] = set()
+    clauses: list[dict] = []
     for segment in segments:
         body = " ".join(segment["body"].split())
         summary = body[:SUMMARY_TEXT_CHARS]
@@ -429,10 +500,96 @@ def extract_clauses_from_pdf(pdf_path: Path) -> dict:
             clause["weekly_hours"] = weekly_hours
             doc_weekly_hours.update(weekly_hours)
         clauses.append(clause)
+    return clauses, percent_totals, doc_weekly_hours
 
+
+def extract_clauses_from_pdf(pdf_path: Path) -> dict:
+    """Full local pipeline for one PDF: readability, OCR fallback, splitting, classification."""
+    meta = parse_pdf_path(pdf_path)
+    empty = {"meta": meta, "clauses": [], "percent_counts": {}, "weekly_hours": []}
+    if PdfReader is None:
+        source_info = {
+            **meta, "pages": 0, "total_text_chars": 0, "readable_page_share": 0.0,
+            "source_readable": False, "clause_count": 0,
+            "extraction_method": "none",
+            "ocr_available": False, "ocr_note": "pypdf not installed",
+        }
+        return {**empty, "source_info": source_info}
+
+    try:
+        page_texts = extract_pdf_texts(pdf_path)
+    except Exception:  # unreadable/corrupted file: keep honest, do not crash
+        source_info = {
+            **meta, "pages": 0, "total_text_chars": 0, "readable_page_share": 0.0,
+            "source_readable": False, "clause_count": 0,
+            "extraction_method": "none",
+            "ocr_available": False, "ocr_note": "pypdf could not open the PDF",
+        }
+        return {**empty, "source_info": source_info}
+
+    readable, total_chars, share = pdf_readability(page_texts)
+    source_info = {
+        **meta,
+        "pages": len(page_texts),
+        "total_text_chars": total_chars,
+        "readable_page_share": round(share, 3),
+        "source_readable": readable,
+        "clause_count": 0,
+    }
+    if readable:
+        source_info["extraction_method"] = "pypdf+regex"
+        full_text, offsets = build_page_offsets(page_texts)
+        clauses, percent_totals, doc_weekly_hours = classify_document_segments(full_text, meta, offsets)
+        source_info["clause_count"] = len(clauses)
+        return {
+            **empty,
+            "source_info": source_info,
+            "clauses": clauses,
+            "percent_counts": percent_totals,
+            "weekly_hours": sorted(doc_weekly_hours),
+        }
+
+    # Scanned PDF (no text layer): optional tesseract OCR fallback.
+    source_info["ocr_available"] = False
+    ocr_available, ocr_note, binary = detect_ocr_environment()
+    source_info.update({"ocr_available": ocr_available, "ocr_note": ocr_note})
+    if not ocr_available:
+        source_info["extraction_method"] = "none"
+        return {**empty, "source_info": source_info}
+
+    language = resolve_ocr_language(binary)
+    try:
+        ocr_texts, ocr_meta = ocr_pdf_page_texts(pdf_path, binary, language)
+    except Exception as exc:  # OCR is best-effort: report, never fail the run
+        source_info.update({
+            "ocr_used": False,
+            "ocr_note": f"OCR attempt failed: {exc}",
+            "extraction_method": "none",
+            "ocr_language": language,
+        })
+        return {**empty, "source_info": source_info}
+
+    ocr_total = sum(len(text) for text in ocr_texts)
+    ocr_used = ocr_total >= MIN_TOTAL_CHARS and ocr_meta["images_ocrd"] > 0
+    source_info.update({
+        "ocr_used": ocr_used,
+        "ocr_language": language,
+        "ocr_total_text_chars": ocr_total,
+        "ocr_images_ocrd": ocr_meta["images_ocrd"],
+        "ocr_pages_ocrd": sum(1 for t in ocr_texts if t.strip()),
+        "ocr_note": ("scanned-only PDF rescued via tesseract OCR" if ocr_used
+                     else "OCR produced no usable text (no embedded page images or unreadable output)"),
+    })
+    if not ocr_used:
+        source_info["extraction_method"] = "none"
+        return {**empty, "source_info": source_info}
+
+    source_info["extraction_method"] = "pypdf+regex+ocr"
+    full_text, offsets = build_page_offsets(ocr_texts)
+    clauses, percent_totals, doc_weekly_hours = classify_document_segments(full_text, meta, offsets)
     source_info["clause_count"] = len(clauses)
     return {
-        "meta": meta,
+        **empty,
         "source_info": source_info,
         "clauses": clauses,
         "percent_counts": percent_totals,
@@ -569,13 +726,19 @@ def run() -> dict:
     validation: list[dict] = []
     percent_totals = {"50": 0, "70": 0, "100": 0}
     readable_count = 0
+    ocr_rescued_count = 0
 
     for pdf_path in pdfs:
         result = extract_clauses_from_pdf(pdf_path)
-        sources.append(result["source_info"])
-        if not result["source_info"]["source_readable"]:
+        source_info = result["source_info"]
+        sources.append(source_info)
+        contributes = source_info.get("source_readable") or source_info.get("ocr_used", False)
+        if not contributes:
             continue
-        readable_count += 1
+        if source_info.get("source_readable"):
+            readable_count += 1
+        if source_info.get("ocr_used"):
+            ocr_rescued_count += 1
         clauses.extend(result["clauses"])
         for percent, hits in result["percent_counts"].items():
             percent_totals[percent] += hits
@@ -586,6 +749,7 @@ def run() -> dict:
             "pdf_path": meta["pdf_path"],
             "union_state": meta["union_state"],
             "period": meta["period"],
+            "extraction_method": source_info.get("extraction_method"),
             "extracted_weekly_hours": extracted_hours,
             "dim_weekly_hours": dim_hours,
             "status": validate_weekly_hours(extracted_hours, dim_hours),
@@ -611,14 +775,24 @@ def run() -> dict:
     mismatches = [entry for entry in validation if entry["status"] == "mismatch"]
     checked = [entry for entry in validation if entry["status"] in ("match", "mismatch")]
 
+    ocr_languages = sorted({s["ocr_language"] for s in sources if s.get("ocr_used")})
+
     document = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "extraction_method": "pypdf + regex rules",
         "offline": True,
         "llm_used": False,
+        "ocr_fallback": {
+            "enabled": True,
+            "used_for_sources": ocr_rescued_count,
+            "languages": ocr_languages,
+            "per_source_id": "sources[*].extraction_method = 'pypdf+regex+ocr' "
+                             "plus sources[*].ocr_used / ocr_note for details",
+        },
         "source_count": len(pdfs),
         "readable_source_count": readable_count,
-        "unreadable_source_count": len(pdfs) - readable_count,
+        "ocr_rescued_source_count": ocr_rescued_count,
+        "unreadable_source_count": len(pdfs) - readable_count - ocr_rescued_count,
         "total_clauses": len(clauses),
         "avg_confidence": round(sum(c["confidence"] for c in clauses) / len(clauses), 3) if clauses else 0.0,
         "by_state": by_state,
@@ -634,9 +808,9 @@ def run() -> dict:
         },
         "sources": sources,
         "extraction_note": (
-            "Scanned PDFs (no text layer) are marked source_readable: false: "
-            "RN/CAERN ACTs and MG Copasa 2025-2027 could not be parsed by pypdf; "
-            "extrato real limitado aos documentos legíveis."
+            "Scanned PDFs (no text layer) attempt an optional tesseract OCR "
+            "fallback; without OCR tooling they stay marked source_readable: "
+            "false and are excluded from the extract."
             if readable_count < len(pdfs) else
             "All sources readable."
         ),
@@ -658,6 +832,7 @@ def main() -> None:
         print(f"dim_cct_clause.parquet -> {DIM_CCT_CLAUSE} (gold, on-demand target)")
     print(f"gold_manifest.json        -> {GOLD_MANIFEST_PATH}")
     print(f"sources={document['source_count']} readable={document['readable_source_count']} "
+          f"ocr_rescued={document['ocr_rescued_source_count']} "
           f"clauses={document['total_clauses']} avg_confidence={document['avg_confidence']}")
     print(f"by_state={document['by_state']}")
     print(f"by_category={document['by_category']}")

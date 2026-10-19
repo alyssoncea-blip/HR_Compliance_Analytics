@@ -295,6 +295,8 @@ A única fonte real do projeto. Baixadas de sites oficiais de sindicatos e regis
 
 **Método — 100% offline (sem LLM, sem APIs externas):** `pipelines/nlp/cct_extractor.py` lê os PDFs reais de `Docs/CCTs/` com **pypdf**, detecta cabeçalhos de cláusulas (`CLÁUSULA 12ª`, `CLÁUSULA DÉCIMA QUINTA`) e classifica cada cláusula por regras de regex/expansão de termos em português (jornada, horas extras, adicional noturno, periculosidade, insalubridade, banco de horas, férias, reajuste, benefícios, cláusulas sociais). Saída reprodutível em `data/gold/governance/cct_extracted_rules.json`. PDFs escaneados (sem camada de texto — RN/CAERN e MG 2025-2027) são marcados `source_readable: false` em vez de falhar.
 
+*Fallback OCR (opcional): com `pip install -r requirements-ocr.txt` e o binário Tesseract no PATH, PDFs só-imagem ganham tentativa de OCR por página (tesseract, traineddata `por` quando disponível); fontes resgatadas aparecem com `extraction_method: pypdf+regex+ocr` no JSON. Sem o OCR instalado, tudo degrada graciosamente (`ocr_available: false`).*
+
 **KPIs:**
 - **CCTs Processadas:** Total de PDFs de ACT/CCT em `Docs/CCTs` por estado, incluindo contagem de legíveis vs. escaneados.
 - **Cláusulas Extraídas Automaticamente:** Total de cláusulas reais extraídas por pypdf + regex (jornada semanal, adicionais, benefícios, sociais).
@@ -856,6 +858,8 @@ The only real source in the project. Downloaded from official union websites and
 **Institutional Use Case:** Labor legal, advanced compliance, innovation. Answers: "Did the extractor understand the agreement correctly?"
 
 **Method — 100% offline (no LLM, no external APIs):** `pipelines/nlp/cct_extractor.py` reads the real PDFs from `Docs/CCTs/` with **pypdf**, detects clause headers (`CLÁUSULA 12ª`, `CLÁUSULA DÉCIMA QUINTA`) and classifies each clause through Portuguese keyword/term-expansion regex rules (shift, overtime, night shift, hazard pay, unhealthy conditions, hour bank, vacations, adjustments, benefits, social clauses). Reproducible output at `data/gold/governance/cct_extracted_rules.json`. Scanned PDFs (no text layer — RN/CAERN and MG 2025-2027) are marked `source_readable: false` instead of failing.
+
+*OCR fallback (optional): with `pip install -r requirements-ocr.txt` and the Tesseract binary on PATH, image-only PDFs get a per-page OCR attempt (tesseract, `por` traineddata when available); rescued sources show `extraction_method: pypdf+regex+ocr` in the JSON. Without the OCR tooling everything degrades gracefully (`ocr_available: false`).*
 
 **KPIs:**
 - **CBAs Processed:** Total of real CBA/ACT PDFs in `Docs/CCTs` by state, including readable vs. scanned counts.

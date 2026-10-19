@@ -4,8 +4,21 @@ Reads raw CSV from data/bronze/, standardizes schemas, casts types,
 adds lineage columns (source_file, ingested_at),
 writes ZSTD-compressed Parquet to data/silver/.
 """
-import duckdb, os, json, time
+import duckdb, os, json, time, argparse, sys
 from datetime import datetime, timezone
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from incremental import plan_delta
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Bronze -> Silver loader")
+    parser.add_argument("--incremental", action="store_true",
+        help="Incremental load for fact_time_record: only rows with date > the Silver "
+             "high-watermark are loaded and merged into the existing Parquet. "
+             "Default (no flag) keeps the full rewrite behavior.")
+    return parser.parse_args()
+
+INCREMENTAL = parse_args().incremental
 
 SILVER = "data/silver"
 BRONZE = "data/bronze"
@@ -16,6 +29,9 @@ con = duckdb.connect()
 
 def csv_q(path):
     return f"read_csv_auto('{BRONZE}/{path}')".replace(chr(92), "/")
+
+def pq_q(path):
+    return path.replace(chr(92), "/")
 
 def write_pq(name, sql):
     path = f"{SILVER}/{name}.parquet"
@@ -29,6 +45,86 @@ def lineage_columns(source):
 
 def lineage_columns_generated(source):
     return f"'{source}' AS source_file, TIMESTAMP '{NOW_ISO}' AS ingested_at, CAST(HASH(CAST(d AS VARCHAR)) AS VARCHAR) AS source_hash"
+
+FACT_TIME_RECORD_SQL = f"""
+SELECT c.*, CAST(STRFTIME(CAST(c.date AS DATE),'%Y%m%d')AS INT) date_sk,
+  CAST(c.date AS DATE) full_date, {lineage_columns('time_clock/time_records.csv')}
+FROM {csv_q('time_clock/time_records.csv')} c
+"""
+
+def load_fact_time_record_incremental() -> dict:
+    """Incremental append for fact_time_record (the 7M-row table).
+
+    High-watermark = MAX(full_date) present in the existing Silver Parquet.
+    Only Bronze rows strictly after the watermark are read from the 550MB CSV,
+    written as a delta Parquet, then merged (UNION ALL old+deltas) into the
+    final ZSTD file. Old rows keep their original ingested_at/source_hash;
+    new rows are stamped with this run's NOW_ISO.
+    """
+    pq_path = pq_q(f"{SILVER}/fact_time_record.parquet")
+    delta_path = pq_q(f"{SILVER}/fact_time_record_delta.parquet")
+    if not os.path.exists(pq_path):
+        print("  no existing fact_time_record.parquet -> cold start (full load)")
+        write_pq("fact_time_record", FACT_TIME_RECORD_SQL)
+        return {"mode": "full", "reason": "no existing fact_time_record.parquet"}
+
+    watermark_ts = con.execute(
+        f"SELECT MAX(full_date) FROM read_parquet('{pq_path}')"
+    ).fetchone()[0]
+    if watermark_ts is None:
+        print("  existing table is empty -> cold start (full load)")
+        write_pq("fact_time_record", FACT_TIME_RECORD_SQL)
+        return {"mode": "full", "reason": "existing fact_time_record.parquet is empty"}
+    watermark = watermark_ts.isoformat()
+
+    bronze_dates = [row[0].isoformat() for row in con.execute(
+        f"SELECT DISTINCT CAST(c.date AS DATE) AS d FROM {csv_q('time_clock/time_records.csv')} c ORDER BY 1"
+    ).fetchall()]
+    dates_to_load = plan_delta(bronze_dates, watermark)
+    print(f"  watermark={watermark} "
+          f"bronze_dates={len(bronze_dates)} dates_to_load={len(dates_to_load)}")
+
+    if not dates_to_load:
+        rows_old = con.execute(f"SELECT count(*) FROM read_parquet('{pq_path}')").fetchone()[0]
+        print(f"  {rows_old:>10,} rows (no delta: already up to date)")
+        return {"mode": "incremental", "watermark": watermark, "rows_old": rows_old, "rows_new": 0,
+                "distinct_new_dates": 0, "delta_parquet": None}
+
+    max_new = dates_to_load[-1]
+    delta_sql = f"""
+SELECT c.*, CAST(STRFTIME(CAST(c.date AS DATE),'%Y%m%d')AS INT) date_sk,
+  CAST(c.date AS DATE) full_date, {lineage_columns('time_clock/time_records.csv')}
+FROM {csv_q('time_clock/time_records.csv')} c
+WHERE CAST(c.date AS DATE) > DATE '{watermark}'
+"""
+    con.execute(f"COPY ({delta_sql}) TO '{delta_path}' "
+                "(FORMAT PARQUET, COMPRESSION ZSTD)")
+    rows_new = con.execute(f"SELECT count(*) FROM read_parquet('{delta_path}')").fetchone()[0]
+
+    merged_path = pq_q(f"{SILVER}/fact_time_record.tmp.parquet")
+    merge_sql = f"""
+SELECT * FROM read_parquet('{pq_path}') WHERE full_date <= DATE '{watermark}'
+UNION ALL
+SELECT * FROM read_parquet('{delta_path}')
+"""
+    con.execute(f"COPY ({merge_sql}) TO '{merged_path}' "
+                "(FORMAT PARQUET, COMPRESSION ZSTD)")
+    rows_old = con.execute(f"SELECT count(*) FROM read_parquet('{pq_path}')").fetchone()[0]
+    if os.path.exists(merged_path) and os.path.getsize(merged_path) > 0:
+        os.replace(merged_path, f"{SILVER}/fact_time_record.parquet")
+    # The delta artifact was written, merged and survived only until the merged
+    # file replaced the main one: leaving it behind would inflate the Silver
+    # table count counted by governance. Its metrics are kept in the manifest.
+    if os.path.exists(delta_path):
+        os.remove(delta_path)
+    rows_total = con.execute(f"SELECT count(*) FROM read_parquet('{pq_path}')").fetchone()[0]
+    size_mb = os.path.getsize(f"{SILVER}/fact_time_record.parquet") / 1024 / 1024
+    print(f"  fact_time_record               {rows_total:>10,} rows  {size_mb:>8.1f} MB "
+          f"(old={rows_old:,} + new={rows_new:,}, watermark {watermark} -> {max_new})")
+    return {"mode": "incremental", "watermark": watermark, "rows_old": rows_old,
+            "rows_new": rows_new, "distinct_new_dates": len(dates_to_load),
+            "rows_total": rows_total, "delta_parquet": delta_path}
+
 
 print("=" * 60)
 print("BRONZE -> SILVER PIPELINE")
@@ -93,12 +189,12 @@ FROM {csv_q('hr_system/employees.csv')} c
 # ---------------------------------------------------------------------------
 # 6. fact_time_record
 # ---------------------------------------------------------------------------
-print("\n[6/9] fact_time_record")
-write_pq("fact_time_record", f"""
-SELECT c.*, CAST(STRFTIME(CAST(c.date AS DATE),'%Y%m%d')AS INT) date_sk,
-  CAST(c.date AS DATE) full_date, {lineage_columns('time_clock/time_records.csv')}
-FROM {csv_q('time_clock/time_records.csv')} c
-""")
+print("\n[6/9] fact_time_record" + (" (incremental)" if INCREMENTAL else ""))
+if INCREMENTAL:
+    fact_time_record_incremental = load_fact_time_record_incremental()
+else:
+    write_pq("fact_time_record", FACT_TIME_RECORD_SQL)
+    fact_time_record_incremental = {"mode": "full", "reason": "--incremental not passed"}
 
 # ---------------------------------------------------------------------------
 # 7. fact_payroll
@@ -149,6 +245,7 @@ elapsed = time.time() - t0
 total_tables = len([f for f in os.listdir(SILVER) if f.endswith('.parquet')])
 print(f"\nDone in {elapsed:.1f}s — {total_tables} tables in {SILVER}")
 
-manifest = {"pipeline":"bronze_to_silver","run_at":NOW_ISO,"elapsed_s":round(elapsed,1),"output_tables":total_tables}
+manifest = {"pipeline":"bronze_to_silver","run_at":NOW_ISO,"elapsed_s":round(elapsed,1),"output_tables":total_tables,
+            "fact_time_record_incremental": fact_time_record_incremental}
 with open(f"{SILVER}/silver_manifest.json","w") as f: json.dump(manifest,f,indent=2)
 con.close()
