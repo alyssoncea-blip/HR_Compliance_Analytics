@@ -26,6 +26,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 from quality.gates import resolve_gates, load_gates_config, DEFAULT_CONFIG  # noqa: E402
+from quality.trend import evaluate_trend, evaluate_freshness, merge_overall_status, check_key  # noqa: E402
 
 GATES_CONFIG_PATH = os.path.join(_HERE, "quality", "gates.json")
 
@@ -34,6 +35,7 @@ BRONZE = "data/bronze"
 GOLD = "data/gold"
 GOV = f"{GOLD}/governance"
 OBS = f"{GOLD}/observability"
+BASELINE_PATH = f"{GOV}/quality_baseline.json"
 NOW_ISO = datetime.now(timezone.utc).isoformat()
 
 os.makedirs(GOV, exist_ok=True)
@@ -337,6 +339,34 @@ except Exception as e:
     gates_config_source = "builtin_default"
 
 gate_verdict = resolve_gates(quality_results, gates_config)
+
+# --- Trend regression vs persisted baseline (previous run) ---
+baseline = None
+if os.path.exists(BASELINE_PATH):
+    try:
+        with open(BASELINE_PATH, "r", encoding="utf-8") as f:
+            baseline = json.load(f)
+    except Exception as e:
+        print(f"  WARN: could not read baseline {BASELINE_PATH} ({str(e)[:80]}); treating as first run")
+        baseline = None
+trend_verdict = evaluate_trend(quality_results, baseline, gates_config)
+
+# --- Freshness: age (hours) of key Parquet files per layer ---
+age_by_table = {}
+for layer, tables in TABLES.items():
+    for name, path_expr in tables.items():
+        real_path = path_expr.strip("'")
+        try:
+            age_by_table[f"{layer}/{name}"] = (time.time() - os.path.getmtime(real_path)) / 3600.0
+        except OSError:
+            print(f"  WARN: freshness unavailable for {layer}/{name} (missing file: {real_path})")
+freshness_verdict = evaluate_freshness(age_by_table, gates_config)
+
+gate_verdict["trend"] = trend_verdict
+gate_verdict["freshness"] = freshness_verdict
+gate_verdict["overall_status"] = merge_overall_status(
+    gate_verdict["overall_status"], trend_verdict, freshness_verdict)
+
 gate_verdict["run_at"] = NOW_ISO
 gate_verdict["config_source"] = gates_config_source
 
@@ -347,7 +377,30 @@ print(f"  Gates verdict: {gate_verdict['overall_status']}")
 for g in gate_verdict["gates"]:
     pct = "-" if g["pass_pct"] is None else g["pass_pct"]
     print(f"    {str(g['id']):32s} {g['status']:14s} pass_pct={pct} matches={g['matched_checks']}")
+trend_flag = " (first run)" if trend_verdict["first_run"] else ""
+print(f"  Trend: {trend_verdict['status']}{trend_flag} compared={trend_verdict['checks_compared']} "
+      f"regressions={trend_verdict['regression_count']} improvements={trend_verdict['improvement_count']}")
+print(f"  Freshness: {freshness_verdict['status']} (mode={freshness_verdict['mode']}) "
+      f"warn={len(freshness_verdict['warn_tables'])} fail={len(freshness_verdict['fail_tables'])} "
+      f"oldest_hours={freshness_verdict['max_age_hours']}")
 print(f"  Gates output: {path_gates}")
+
+# Persist baseline for the next run (check_key -> fail_count/pass_pct/updated_at)
+baseline_out = {
+    "pipeline": "governance",
+    "run_at": NOW_ISO,
+    "checks": {
+        check_key(r.get("layer"), r.get("check_sql")): {
+            "fail_count": r.get("fail_count"),
+            "pass_pct": r.get("pass_pct"),
+            "updated_at": NOW_ISO,
+        }
+        for r in quality_results
+    },
+}
+with open(BASELINE_PATH, "w", encoding="utf-8") as f:
+    json.dump(baseline_out, f, indent=2, ensure_ascii=False)
+print(f"  Baseline: {BASELINE_PATH}")
 
 # Observability event and SLA evaluation
 failed_critical = len([r for r in quality_results if r["status"] in ("FAIL", "ERROR") and r["severity"] in ("critical", "high")])
@@ -363,6 +416,23 @@ obs_event = {
         "blocking_gate_failures": gate_verdict["blocking_gate_failures"],
         "warned_gates": gate_verdict["warned_gates"],
         "informational_gate_findings": gate_verdict["informational_gate_findings"],
+    },
+    "trend": {
+        "status": trend_verdict["status"],
+        "mode": trend_verdict["mode"],
+        "first_run": trend_verdict["first_run"],
+        "checks_compared": trend_verdict["checks_compared"],
+        "regressions": trend_verdict["regression_count"],
+        "improvements": trend_verdict["improvement_count"],
+        "critical_regressions": len(trend_verdict["critical_regressions"]),
+    },
+    "freshness": {
+        "status": freshness_verdict["status"],
+        "mode": freshness_verdict["mode"],
+        "tables_checked": freshness_verdict["tables_checked"],
+        "warn_tables": freshness_verdict["warn_tables"],
+        "fail_tables": freshness_verdict["fail_tables"],
+        "max_age_hours": freshness_verdict["max_age_hours"],
     },
 }
 
@@ -593,6 +663,7 @@ governance_manifest = {
     "outputs": {
         "data_quality": "data/gold/governance/data_quality_results.json",
         "quality_gates": "data/gold/governance/quality_gates.json",
+        "quality_baseline": "data/gold/governance/quality_baseline.json",
         "data_catalog": "data/gold/governance/data_catalog.json",
         "data_lineage": "data/gold/governance/data_lineage.json",
     },
@@ -603,6 +674,8 @@ governance_manifest = {
         "gates_overall_status": gate_verdict["overall_status"],
         "blocking_gate_failures": len(gate_verdict["blocking_gate_failures"]),
         "gates_config_source": gates_config_source,
+        "trend_status": trend_verdict["status"],
+        "freshness_status": freshness_verdict["status"],
     },
 }
 obs_event["avg_score"] = governance_manifest["quality_summary"]["avg_score"]
@@ -622,6 +695,19 @@ if obs_event["sla_status"] == "FAIL":
 if gate_verdict["blocking_gate_failures"]:
     with open(f"{OBS}/alerts.log", "a", encoding="utf-8") as f:
         f.write(f"{NOW_ISO} | governance | GATE_FAIL | overall={gate_verdict['overall_status']} | gates={','.join(gate_verdict['blocking_gate_failures'])}\n")
+if trend_verdict["status"] in ("WARN", "FAIL"):
+    with open(f"{OBS}/alerts.log", "a", encoding="utf-8") as f:
+        f.write(f"{NOW_ISO} | governance | TREND_REGRESSION | status={trend_verdict['status']} | "
+                f"regressions={trend_verdict['regression_count']} | "
+                f"critical={len(trend_verdict['critical_regressions'])} | "
+                f"checks={','.join(r['table_name'] + '.' + r['dimension'] for r in trend_verdict['regressions'][:10])}\n")
+if freshness_verdict["status"] != "PASS":
+    with open(f"{OBS}/alerts.log", "a", encoding="utf-8") as f:
+        f.write(f"{NOW_ISO} | governance | FRESHNESS | status={freshness_verdict['status']} | "
+                f"mode={freshness_verdict['mode']} | warn={len(freshness_verdict['warn_tables'])} | "
+                f"fail={len(freshness_verdict['fail_tables'])} | "
+                f"oldest_hours={freshness_verdict['max_age_hours']} | "
+                f"tables={','.join(freshness_verdict['warn_tables'][:10] + freshness_verdict['fail_tables'][:10])}\n")
 
 path_man = f"{GOV}/governance_manifest.json"
 with open(path_man, "w", encoding="utf-8") as f:
@@ -636,6 +722,7 @@ print(f"{'='*60}")
 print(f"  Quality checks: {total_checks} across {len(scores)} tables")
 print(f"  Average quality score: {governance_manifest['quality_summary']['avg_score']}%")
 print(f"  Quality gates: {gate_verdict['overall_status']} (blocking failures: {len(gate_verdict['blocking_gate_failures'])})")
+print(f"  Trend: {trend_verdict['status']} | Freshness: {freshness_verdict['status']} ({freshness_verdict['mode']})")
 if gate_verdict["informational_gate_findings"]:
     print(f"  Informational findings (non-blocking): {', '.join(gate_verdict['informational_gate_findings'])}")
 print(f"  Catalog entries: {sum(len(v['tables']) for v in catalog['layers'].values())} tables")
@@ -643,7 +730,13 @@ print(f"  Lineage flows: {len(lineage['flows'])}")
 print(f"  Output: {GOV}/")
 
 if CLI.fail_on_gate and gate_verdict["overall_status"] == "FAIL":
-    print(f"FAIL: blocking quality gate(s) failed: {', '.join(gate_verdict['blocking_gate_failures'])}")
+    failing = list(gate_verdict["blocking_gate_failures"])
+    if trend_verdict["status"] == "FAIL" and trend_verdict["mode"] == "blocking":
+        failing.append("trend")
+    if freshness_verdict["status"] == "FAIL" and freshness_verdict["mode"] == "blocking":
+        failing.append("freshness")
+    label = ", ".join(failing) if failing else gate_verdict["overall_status"]
+    print(f"FAIL: blocking quality gate(s) failed: {label}")
     con.close()
     sys.exit(1)
 print("\nDone.")
