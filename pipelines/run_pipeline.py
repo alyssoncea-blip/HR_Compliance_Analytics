@@ -23,6 +23,7 @@ def main() -> None:
         ("Bronze to Silver", root / "bronze_to_silver.py"),
         ("Silver to Gold", root / "silver_to_gold.py"),
         ("Labor validation engine", root / "validation_engine.py"),
+        ("Aggregation refresh (passivo pre-aggregations)", root / "refresh_aggs.py"),
         ("Data governance checks", root / "governance.py"),
     ]
 

@@ -14,6 +14,7 @@ case "$MODE" in
         python pipelines/bronze_to_silver.py
         python pipelines/silver_to_gold.py
         python pipelines/validation_engine.py
+        python pipelines/refresh_aggs.py
         python pipelines/governance.py
         echo "=== Pipeline complete ==="
         ;;
@@ -56,6 +57,7 @@ case "$MODE" in
             python pipelines/bronze_to_silver.py
             python pipelines/silver_to_gold.py
             python pipelines/validation_engine.py
+            python pipelines/refresh_aggs.py
             python pipelines/governance.py
             echo "=== Data generation complete ==="
         else

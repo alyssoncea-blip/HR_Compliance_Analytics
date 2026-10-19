@@ -284,18 +284,10 @@ GROUP BY un.name, un.state, un.standard_weekly_hours, f.year, f.month, f.compete
 """
 write_pq("agg_union_monthly", sql_agg_union)
 
-# agg_passivo_by_unit
-sql_agg_passivo = f"""
-SELECT u.name AS unit_name, u.state,
-       fp.liability_type, fp.severity,
-       COUNT(*) AS occurrence_count,
-       ROUND(SUM(fp.estimated_impact), 0) AS total_estimated_impact,
-       ROUND(AVG(fp.estimated_impact), 0) AS avg_impact
-FROM read_parquet({gq('fact_passivo_trabalhista')}) fp
-JOIN read_parquet({pq('dim_unit')}) u ON fp.unit_id = u.unit_id
-GROUP BY u.name, u.state, fp.liability_type, fp.severity
-"""
-write_pq("agg_passivo_by_unit", sql_agg_passivo)
+# Note: agg_passivo_by_unit is NOT built here. fact_passivo_trabalhista is
+# still an empty placeholder at this stage and only gets materialized later
+# by validation_engine.py. Passivo pre-aggregations are rebuilt from the
+# final Gold state by pipelines/refresh_aggs.py (runs after validation_engine).
 
 # agg_vacation_risk
 sql_agg_vac = f"""
@@ -343,7 +335,7 @@ manifest = {
     "output_tables": total_tables,
     "targets": [
         "dim_cct_rule_version", "dim_liability_factor_version", "dim_employee_scd2", "fact_monthly_employee", "fact_passivo_trabalhista",
-        "agg_unit_monthly", "agg_union_monthly", "agg_passivo_by_unit",
+        "agg_unit_monthly", "agg_union_monthly",
         "agg_vacation_risk", "agg_employee_annual",
     ],
 }

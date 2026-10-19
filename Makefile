@@ -9,6 +9,7 @@ help:
 	@echo ""
 	@echo "  make dev             Run Dash app locally"
 	@echo "  make pipeline        Run full data pipeline locally"
+	@echo "  make refresh-aggs    Rebuild passivo pre-aggregations from final Gold"
 	@echo "  make test            Run test suite"
 	@echo "  make clean           Remove generated data"
 	@echo ""
@@ -26,6 +27,9 @@ dev:
 
 pipeline:
 	python pipelines/run_pipeline.py
+
+refresh-aggs:
+	python pipelines/refresh_aggs.py
 
 test:
 	python -m pytest tests/ -v
