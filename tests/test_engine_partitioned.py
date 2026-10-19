@@ -51,6 +51,20 @@ def det_full_state():
         _run_engine()
 
 
+@pytest.fixture(scope="module", autouse=True)
+def resync_aggs_after_partition():
+    """A partitioned engine run rewrites fact_passivo_trabalhista; rebuild the
+    dependent pre-aggregation afterwards so downstream tests (ordering guard)
+    compare against a consistent Gold state."""
+    yield
+    if not os.path.exists(MONTHLY_PATH):
+        return
+    subprocess.run(
+        [sys.executable, os.path.join("pipelines", "refresh_aggs.py")],
+        cwd=ROOT, capture_output=True, text=True, timeout=600, check=True,
+    )
+
+
 @pytest.fixture
 def con():
     c = duckdb.connect(":memory:")
