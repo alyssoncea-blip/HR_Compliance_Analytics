@@ -3,13 +3,61 @@ import dash_bootstrap_components as dbc
 from dash import html, dcc
 import plotly.graph_objects as go
 import pandas as pd
+import json
 from datetime import datetime
+from pathlib import Path
 from app.theme.colors import PETROLEO, AZUL_CLARO, CINZA, BRANCO, VERDE, AMARELO, VERMELHO
-from app.data import ccts_processadas, regras_extraidas, distribuicao_entidades, cct_evolution_data
+from app.data import ccts_processadas, distribuicao_entidades, cct_evolution_data
 
 # ---------------------------------------------------------------------------
-# Fallback / mock data
+# Real data loader for the offline CCT clause extractor output
 # ---------------------------------------------------------------------------
+EXTRACTED_RULES_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "data" / "gold" / "governance" / "cct_extracted_rules.json"
+)
+
+UNCATEGORIZED = "nao_classificada"
+
+
+def _load_extracted_rules(path: Path | None = None) -> tuple[dict | None, pd.DataFrame, str | None]:
+    """Load the offline CCT clause extraction produced by pipelines/nlp/cct_extractor.py.
+
+    Returns (data, clauses_df, message). There is NO mock fallback: when the
+    file is missing or empty the message explains how to generate it for real
+    from the PDFs in Docs/CCTs/.
+    """
+    target = Path(path) if path else EXTRACTED_RULES_PATH
+    try:
+        with open(target, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return None, pd.DataFrame(), "missing"
+    except (json.JSONDecodeError, OSError):
+        return None, pd.DataFrame(), "unreadable"
+
+    clauses = data.get("clauses") or []
+    if not clauses:
+        return data, pd.DataFrame(), "empty"
+    return data, pd.DataFrame(clauses), None
+
+
+def _extractor_banner():
+    return dbc.Alert([
+        html.Span("⚠ Sem dados de extração de CCT. ", style={"fontWeight": "700"}),
+        html.Span(
+            "Esta página consome o JSON REAL de cláusulas extraídas offline "
+            "(pypdf + regex) dos PDFs em Docs/CCTs/. "
+            f"Arquivo não encontrado em: {EXTRACTED_RULES_PATH}. ",
+            style={"fontWeight": "400"},
+        ),
+        html.Span(
+            "Execute: python pipelines/nlp/cct_extractor.py",
+            style={"fontWeight": "700", "fontFamily": "monospace"},
+        ),
+    ], color="warning", style={"fontSize": "0.75rem", "padding": "8px 12px", "marginBottom": "0px"})
+
+
 def _safe_ccts():
     try:
         df = ccts_processadas()
@@ -24,21 +72,6 @@ def _safe_ccts():
             "standard_weekly_hours": [44, 44, 30],
             "cct_year_start": [2023, 2023, 2020],
             "cct_year_end": [2025, 2025, 2024],
-        })
-
-
-def _safe_regras():
-    try:
-        df = regras_extraidas()
-        if df.empty:
-            raise ValueError("empty")
-        return df
-    except Exception:
-        return pd.DataFrame({
-            "regra_id": [1, 2, 3, 4, 5, 6, 7, 8],
-            "regra": ["Jornada semanal MG", "Jornada semanal RN", "HE 1ª hora", "HE adicional", "Adicional noturno", "Reajuste ACT 2024 RN", "Benefício VA/VR RN", "Social clause — assédio"],
-            "nivel": ["regular", "regular", "regular", "regular", "alto", "regular", "alto", "alto"],
-            "category": ["Jornada", "Jornada", "HE", "HE", "Adicional", "Reajuste", "Benefício", "Social"],
         })
 
 
@@ -204,102 +237,94 @@ def _cct_evolution_fig():
 # ---------------------------------------------------------------------------
 # UI builders
 # ---------------------------------------------------------------------------
-def _rules_table():
-    df = _safe_regras()
-    header_style = {
-        "borderBottom": "2px solid #e2e8f0", "padding": "5px 8px",
-        "fontSize": "0.7rem", "fontWeight": "700", "color": "#1A202C", "textAlign": "left",
-    }
-    cell_style = {"padding": "4px 8px", "fontSize": "0.68rem", "color": "#4A5568", "borderBottom": "1px solid #f7fafc", "textAlign": "left"}
-    rows = [html.Tr([
-        html.Th("Regra", style=header_style),
-        html.Th("Categoria", style=header_style),
-        html.Th("Nivel", style=header_style),
-        html.Th("Confianca (%)", style=header_style),
-        html.Th("Fonte", style=header_style),
-        html.Th("Status", style={**header_style, "textAlign": "center"}),
-        html.Th("Acao", style={**header_style, "textAlign": "center"}),
-    ])]
-    for _, d in df.iterrows():
-        nivel = str(d.get("nivel", "regular")).lower()
-        rule_name = str(d.get("regra", ""))
-        category = str(d.get("category", ""))
-        regra_id = str(d.get("regra_id", ""))
-        if nivel == "regular":
-            confidence, extracted, status, status_color = 95.0, "95%", "Validado", VERDE
-        elif nivel == "alto":
-            confidence, extracted, status, status_color = 85.0, "85%", "Validado", VERDE
-        elif nivel == "critico":
-            confidence, extracted, status, status_color = 60.0, "60%", "Critico", VERMELHO
-        else:
-            confidence, extracted, status, status_color = 80.0, "80%", "Review", AMARELO
-        conf_color = VERDE if confidence >= 90 else (AMARELO if confidence >= 80 else VERMELHO)
-        source = f"ACT {regra_id}" if regra_id else "CCT"
-        rows.append(html.Tr([
-            html.Td(rule_name, style=cell_style),
-            html.Td(category, style=cell_style),
-            html.Td(nivel, style=cell_style),
-            html.Td(
-                html.Span(extracted, style={"color": conf_color, "fontWeight": "600"}),
-                style=cell_style,
+def _rules_table(extracted_data, rules_df, rules_message):
+    if not rules_df.empty:
+        header_style = {
+            "borderBottom": "2px solid #e2e8f0", "padding": "5px 8px",
+            "fontSize": "0.7rem", "fontWeight": "700", "color": "#1A202C", "textAlign": "left",
+        }
+        cell_style = {"padding": "4px 8px", "fontSize": "0.68rem", "color": "#4A5568", "borderBottom": "1px solid #f7fafc", "textAlign": "left"}
+        rows = [html.Tr([
+            html.Th("Clausula", style=header_style),
+            html.Th("Titulo / Resumo", style=header_style),
+            html.Th("Categoria", style=header_style),
+            html.Th("Confianca (%)", style=header_style),
+            html.Th("Fonte", style=header_style),
+        ])]
+        for _, clause in rules_df.iterrows():
+            clause_number = str(clause.get("clause_number") or "—")
+            title = str(clause.get("title") or "")[:90]
+            summary = str(clause.get("text") or "")[:110]
+            label = title or summary
+            category = str(clause.get("category") or "")
+            confidence = float(clause.get("confidence") or 0.0) * 100
+            conf_color = VERDE if confidence >= 80 else (AMARELO if confidence >= 60 else VERMELHO)
+            source = f"{clause.get('union_state', '')} {clause.get('period', '')} · pag. {clause.get('page', '')}"
+            rows.append(html.Tr([
+                html.Td(clause_number, style=cell_style),
+                html.Td(label, style=cell_style),
+                html.Td(category, style={**cell_style, "fontWeight": "600" if category != UNCATEGORIZED else "400"}),
+                html.Td(
+                    html.Span(f"{confidence:.0f}%", style={"color": conf_color, "fontWeight": "600"}),
+                    style=cell_style,
+                ),
+                html.Td(source, style=cell_style),
+            ]))
+        content = html.Div([
+            html.Div(
+                html.Table(rows, style={"width": "100%", "borderCollapse": "collapse"}),
+                style={
+                    "maxHeight": "340px",
+                    "overflowY": "auto",
+                    "overflowX": "auto",
+                    "paddingRight": "4px",
+                },
             ),
-            html.Td(source, style=cell_style),
-            html.Td(
-                html.Div([
-                    html.Span("✓" if status == "Validado" else ("⚠" if status == "Review" else "✗"),
-                              style={"color": status_color, "marginRight": "3px", "fontSize": "0.7rem"}),
-                    html.Span(status, style={"color": status_color, "fontWeight": "600", "fontSize": "0.65rem"}),
-                ]),
-                style={**cell_style, "textAlign": "center"},
-            ),
-            html.Td(
-                html.Div(["👁 ", "✏️", " ✓"] if status != "Critico" else ["✏️", " ✓"],
-                         style={"fontSize": "0.75rem", "textAlign": "center"}),
-                style={**cell_style, "textAlign": "center"},
-            ),
-        ]))
+        ])
+    else:
+        content = rules_message or "Sem cláusulas extraídas."
+
     return html.Div([
-        html.H6("REGRAS EXTRAIDAS DAS CCTs", style={"fontWeight": "700", "fontSize": "14px", "color": "#1A202C", "marginBottom": "4px"}),
-        html.Div(
-            html.Table(rows, style={"width": "100%", "borderCollapse": "collapse"}),
-            style={
-                "maxHeight": "340px",
-                "overflowY": "auto",
-                "overflowX": "auto",
-                "paddingRight": "4px",
-            },
-        ),
+        html.H6("CLAUSULAS REAIS EXTRAIDAS DAS CCTs (pypdf + regex)", style={"fontWeight": "700", "fontSize": "14px", "color": "#1A202C", "marginBottom": "4px"}),
+        content,
     ])
 
 
-def _ai_metrics():
-    try:
-        df = _safe_regras()
-        total = len(df)
-        if total == 0:
-            raise ValueError("empty")
-        regular = int((df["nivel"].str.lower() == "regular").sum())
-        alto = int((df["nivel"].str.lower() == "alto").sum())
-        criticos = int((df["nivel"].str.lower() == "critico").sum())
-        acuracia = round((regular + alto) / total * 100, 1)
-        recall = round((total - criticos) / total * 100, 1)
-        f1 = round(2 * acuracia * recall / (acuracia + recall), 1) if (acuracia + recall) > 0 else 0
+def _ai_metrics(extracted_data, rules_df, rules_message):
+    if rules_df.empty:
         metrics = [
-            ("Modelo", "Legal-BERT ajustado para CCTs", False),
-            ("Acuracia (regras validadas)", f"{acuracia}%", False),
-            ("Recall (taxa de deteccao)", f"{recall}%", False),
-            ("F1-Score", f"{f1}%", f1 < 80),
-            ("Total de Regras", str(total), False),
-            ("Regras Criticas", str(criticos), criticos > 0),
+            ("Metodo", "Extrator offline pypdf + regex (sem LLM)", False),
+            ("Status", "Dados reais nao gerados", True),
+            ("Comando", "python pipelines/nlp/cct_extractor.py", False),
         ]
-    except Exception:
+    else:
+        total = int(len(rules_df))
+        categorized = rules_df[rules_df["category"].fillna(UNCATEGORIZED) != UNCATEGORIZED]
+        pending = int((rules_df["confidence"].fillna(0.0) < 0.8).sum())
+        sources = extracted_data.get("source_count") or 0
+        readable = extracted_data.get("readable_source_count") or 0
+        by_state = extracted_data.get("by_state") or {}
+        by_state_display = " · ".join(f"{state}: {count}" for state, count in sorted(by_state.items())) or "—"
+        percent_counts = extracted_data.get("percent_counts") or {}
+        percent_display = (
+            f"50%: {percent_counts.get('50', 0)} · 70%: {percent_counts.get('70', 0)} · 100%: {percent_counts.get('100', 0)}"
+            if percent_counts else "—"
+        )
+        validation = (extracted_data.get("validation") or {}).get("weekly_hours") or {}
+        validation_display = (
+            f"{validation.get('matches', 0)} match / {len(validation.get('mismatches') or [])} mismatch"
+            if validation else "—"
+        )
         metrics = [
-            ("Modelo", "Legal-BERT ajustado para CCTs", False),
-            ("Acuracia", "94.2%", False),
-            ("Recall", "91.8%", False),
-            ("F1-Score", "93.0%", True),
-            ("Tempo Medio / CCT", "3.4s", False),
-            ("Ultimo Treinamento", "[DD/MM/YYYY, 15/05/2024]", False),
+            ("Metodo", "Extrator offline pypdf + regex (sem LLM)", False),
+            ("Clausulas extraidas", str(total), False),
+            ("Clausulas classificadas", f"{len(categorized)}/{total}", len(categorized) == 0),
+            ("Confianca media", f"{((extracted_data.get('avg_confidence') or 0.0) * 100):.1f}%", (extracted_data.get('avg_confidence') or 0) < 0.8),
+            ("IDs com confianca < 80%", str(pending), pending > 0),
+            ("Fontes legiveis", f"{readable}/{sources}", False),
+            ("Clausulas por estado", by_state_display, False),
+            ("Percentuais em clausulas HE", percent_display, False),
+            ("Validacao jornada semanal vs dim", validation_display, len(validation.get('mismatches') or []) > 0),
         ]
     rows = []
     for label, value, alert in metrics:
@@ -314,7 +339,7 @@ def _ai_metrics():
             ], style={"textAlign": "right"}),
         ], style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "padding": "8px 0", "borderBottom": "1px solid #f0f0f0"}))
     return html.Div([
-        html.H6("MODELO DE IA E METRICAS", style={"fontWeight": "700", "fontSize": "14px", "color": "#1A202C", "marginBottom": "8px"}),
+        html.H6("EXTRACAO NLP — METRICAS DO EXTRATOR OFFLINE", style={"fontWeight": "700", "fontSize": "14px", "color": "#1A202C", "marginBottom": "8px"}),
         html.Div(rows),
     ])
 
@@ -334,49 +359,60 @@ def layout():
 
     # ---- Linha 1: KPIs do Motor de IA ----
     ccts_df = _safe_ccts()
-    regras_df = _safe_regras()
+    extracted_data, rules_df, rules_message = _load_extracted_rules()
+
     ccts_count = len(ccts_df)
-    regras_count = len(regras_df)
+    regras_count = int(len(rules_df)) if not rules_df.empty else int(extracted_data.get("total_clauses") or 0) if extracted_data else 0
     ccts_states = ", ".join(ccts_df["state"].tolist()) if not ccts_df.empty and "state" in ccts_df.columns else "MG, RJ, RN"
-    try:
-        criticas_count = int((regras_df["nivel"].str.lower() == "critico").sum())
-    except Exception:
-        criticas_count = 0
-    try:
-        detection_rate = round((regras_count - criticas_count) / regras_count * 100, 1) if regras_count > 0 else 0
-    except Exception:
-        detection_rate = 91.3
+    pending_count = 0
+    avg_confidence_pct = 0.0
+    if not rules_df.empty:
+        pending_count = int((rules_df["confidence"].fillna(0.0) < 0.8).sum())
+        avg_confidence_pct = float(extracted_data.get("avg_confidence") or 0.0) * 100
+    else:
+        detection_rate = 0
 
     kpi1 = html.Div([
         html.H6("CCTs PROCESSADAS", style={"fontWeight": "700", "fontSize": "12px", "color": "#1A202C", "marginBottom": "4px", "textAlign": "center"}),
         html.H2(str(ccts_count), style={"fontSize": "2.5rem", "fontWeight": "700", "color": "#1A202C", "textAlign": "center", "margin": "0"}),
-        html.P(f"CCTs/ACTs Indexadas ({ccts_states})", style={"fontSize": "0.7rem", "color": "#4A5568", "textAlign": "center"}),
+        html.P(f"PDFs de ACT/CCT em Docs/CCTs ({ccts_states})", style={"fontSize": "0.7rem", "color": "#4A5568", "textAlign": "center"}),
     ], style=card_style)
 
     kpi2 = html.Div([
-        html.H6("REGRAS EXTRAIDAS AUTOMATICAMENTE", style={"fontWeight": "700", "fontSize": "12px", "color": "#1A202C", "marginBottom": "4px", "textAlign": "center"}),
+        html.H6("CLAUSULAS EXTRAIDAS AUTOMATICAMENTE", style={"fontWeight": "700", "fontSize": "12px", "color": "#1A202C", "marginBottom": "4px", "textAlign": "center"}),
         html.Div([
             html.H2(str(regras_count), style={"fontSize": "2.5rem", "fontWeight": "700", "color": "#1A202C", "margin": "0"}),
         ], style={"display": "flex", "alignItems": "center", "justifyContent": "center", "marginBottom": "4px"}),
-        html.P("Regras extraidas por NLP", style={"fontSize": "0.7rem", "color": "#4A5568", "textAlign": "center"}),
+        html.P("Clausulas reais via pypdf + regex (offline)", style={"fontSize": "0.7rem", "color": "#4A5568", "textAlign": "center"}),
     ], style=card_style)
 
     kpi3 = html.Div([
-        html.H6("TAXA DE DETECCAO", style={"fontWeight": "700", "fontSize": "12px", "color": "#1A202C", "marginBottom": "4px", "textAlign": "center"}),
-        dcc.Graph(figure=_confidence_gauge(detection_rate), config={"displayModeBar": False}, style={"height": "90px"}),
-        html.P("Taxa de regras nao-criticas detectadas", style={"fontSize": "0.7rem", "color": "#4A5568", "textAlign": "center"}),
+        html.H6("CONFIANCA MEDIA DA EXTRACAO", style={"fontWeight": "700", "fontSize": "12px", "color": "#1A202C", "marginBottom": "4px", "textAlign": "center"}),
+        dcc.Graph(figure=_confidence_gauge(avg_confidence_pct), config={"displayModeBar": False}, style={"height": "90px"}),
+        html.P("Heuristica de palavras-chave por categoria", style={"fontSize": "0.7rem", "color": "#4A5568", "textAlign": "center"}),
     ], style=card_style)
 
     kpi4 = html.Div([
-        html.H6("REGRAS PENDENTES DE REVISAO", style={"fontWeight": "700", "fontSize": "12px", "color": "#1A202C", "marginBottom": "4px", "textAlign": "center"}),
-        html.H2(str(criticas_count), style={"fontSize": "2.5rem", "fontWeight": "700", "color": "#1A202C", "textAlign": "center", "margin": "0"}),
-        html.P("Regras criticas aguardando validacao humana", style={"fontSize": "0.7rem", "color": "#4A5568", "textAlign": "center"}),
+        html.H6("CLAUSULAS COM CONFIANCA < 80%", style={"fontWeight": "700", "fontSize": "12px", "color": "#1A202C", "marginBottom": "4px", "textAlign": "center"}),
+        html.H2(str(pending_count), style={"fontSize": "2.5rem", "fontWeight": "700", "color": "#1A202C", "textAlign": "center", "margin": "0"}),
+        html.P("Aguardando revisao humana", style={"fontSize": "0.7rem", "color": "#4A5568", "textAlign": "center"}),
     ], style=card_style)
 
     # ---- Linha 2: Regras + Treemap ----
-    rules_card = html.Div([
-        _rules_table(),
-    ], style=card_style)
+    rules_lines = [_rules_table(extracted_data, rules_df, rules_message)]
+    if not rules_df.empty:
+        percent_counts = extracted_data.get("percent_counts") or {}
+        percent_lines = [
+            html.Span(f"50%: {percent_counts.get('50', 0)}", style={"color": AZUL_CLARO, "fontWeight": "700", "marginRight": "10px"}),
+            html.Span(f"70%: {percent_counts.get('70', 0)}", style={"color": AMARELO, "fontWeight": "700", "marginRight": "10px"}),
+            html.Span(f"100%: {percent_counts.get('100', 0)}", style={"color": VERMELHO, "fontWeight": "700"}),
+        ]
+        rules_lines.append(html.Div([
+            html.Span("Menções a percentuais de HE nas cláusulas extraídas: ", style={"fontSize": "0.68rem", "color": "#4A5568"}),
+        ] + percent_lines, style={"marginTop": "6px", "fontSize": "0.68rem"}))
+    else:
+        rules_lines.append(_extractor_banner())
+    rules_card = html.Div(rules_lines, style=card_style)
 
     treemap_card = html.Div([
         html.H6("ENTIDADES EXTRAÍDAS (NUVEM DE PALAVRAS / TREEMAP)", style={"fontWeight": "700", "fontSize": "14px", "color": "#1A202C", "marginBottom": "8px"}),
@@ -389,7 +425,7 @@ def layout():
     ], style=card_style)
 
     metrics_card = html.Div([
-        _ai_metrics(),
+        _ai_metrics(extracted_data, rules_df, rules_message),
     ], style=card_style)
 
     return html.Div([

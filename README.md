@@ -98,6 +98,13 @@ A arquitetura de engenharia de dados foi projetada para simular um ambiente corp
 - Classificação por severidade (Regular, Atenção, Crítico)
 - Cálculo automático de impacto financeiro por inconsistência detectada
 
+**Extrator NLP de CCTs (`pipelines/nlp/cct_extractor.py`)**
+- Extração de texto dos PDFs reais de ACT/CCT (`Docs/CCTs/`) com pypdf
+- Detecção de cabeçalhos de cláusulas (numérica `CLÁUSULA 12ª` e ordinal `CLÁUSULA DÉCIMA QUINTA`) com rastreabilidade de página
+- Classificação por regras de regex/expansão de termos em português em 10 categorias trabalhistas
+- Validação semântica (não-bloqueante) da jornada semanal (30/40/44h) contra `dim_cct_rule_version`
+- PDFs escaneados marcados `source_readable: false` — sem LLM, sem APIs externas, 100% reprodutível
+
 **Governança (`pipelines/governance.py`)**
 - 53 verificações automáticas de qualidade (completude, unicidade, integridade referencial, consistência, validade)
 - Data catalog em JSON com 5.618 linhas de metadados
@@ -151,8 +158,10 @@ HR Compliance Analytics/
 │   ├── ingest/                   # Geração sintética de dados
 │   │   └── main.py
 │   ├── bronze_to_silver.py       # Curadoria e padronização
-│   ├── silver_to_gold.py         # Modelagem dimensional
+│   ├── silver_to_gold.py       # Modelagem dimensional
 │   ├── validation_engine.py      # 32 regras de validação trabalhista
+│   ├── nlp/                      # Extrator offline de cláusulas
+│   │   └── cct_extractor.py      # pypdf + regex (CCTs reais)
 │   └── governance.py             # 53 checks de data quality
 │
 ├── data/                         # Camadas Medallion
@@ -280,19 +289,22 @@ A única fonte real do projeto. Baixadas de sites oficiais de sindicatos e regis
 ---
 
 ### Dashboard 06 — IA & NLP
-**Objetivo:** Demonstrar a camada de Inteligência Artificial aplicada à interpretação automática de CCTs/ACTs em PDF.
+**Objetivo:** Demonstrar a camada de NLP aplicada à extração automática de cláusulas das CCTs/ACTs reais em PDF.
 
-**Caso de Uso Institucional:** Jurídico trabalhista, compliance avançado, inovação. Responde: "A IA entendeu a convenção corretamente?"
+**Caso de Uso Institucional:** Jurídico trabalhista, compliance avançado, inovação. Responde: "O extrator entendeu a convenção corretamente?"
+
+**Método — 100% offline (sem LLM, sem APIs externas):** `pipelines/nlp/cct_extractor.py` lê os PDFs reais de `Docs/CCTs/` com **pypdf**, detecta cabeçalhos de cláusulas (`CLÁUSULA 12ª`, `CLÁUSULA DÉCIMA QUINTA`) e classifica cada cláusula por regras de regex/expansão de termos em português (jornada, horas extras, adicional noturno, periculosidade, insalubridade, banco de horas, férias, reajuste, benefícios, cláusulas sociais). Saída reprodutível em `data/gold/governance/cct_extracted_rules.json`. PDFs escaneados (sem camada de texto — RN/CAERN e MG 2025-2027) são marcados `source_readable: false` em vez de falhar.
 
 **KPIs:**
-- **CCTs Processadas:** Número de convenções indexadas por estado e vigência.
-- **Regras Extraídas Automaticamente:** Total de regras extraídas por NLP com variação mensal.
-- **Taxa Média de Confiança:** Gauge semicircular com percentual de confiança das extrações (≥90% verde, 80-89% amarelo, <80% vermelho).
-- **Regras Pendentes de Revisão:** Contagem de regras com confiança <80% aguardando validação humana.
-- **Regras Extraídas da CCT:** Tabela com Regra, Entidade, Valor Extraído, Confiança, Fonte (Cláusula) e Status. Permite click para revisão do trecho PDF original.
+- **CCTs Processadas:** Total de PDFs de ACT/CCT em `Docs/CCTs` por estado, incluindo contagem de legíveis vs. escaneados.
+- **Cláusulas Extraídas Automaticamente:** Total de cláusulas reais extraídas por pypdf + regex (jornada semanal, adicionais, benefícios, sociais).
+- **Confiança Média da Extração:** Gauge derivado da média de confiança heurística das cláusulas (JSON real; ≥80% verde, 60-79% amarelo, <60% vermelho).
+- **Cláusulas com Confiança < 80%:** Contagem de cláusulas heurísticas aguardando revisão humana.
+- **Cláusulas Reais Extraídas da CCT:** Tabela com número da cláusula, título, categoria, confiança e fonte (estado/período/página do PDF).
+- **Menções a Percentuais de HE:** Contador de menções a 50% / 70% / 100% nas cláusulas extraídas.
 - **Entidades Extraídas (Treemap):** Visualização de frequência de entidades por categoria (Jornada, Hora Extra, Adicional Noturno, Periculosidade, Insalubridade, Reajustes, Benefícios, Cláusulas Sociais).
-- **Comparativo Histórico de Regras:** Timeline horizontal mostrando evolução de reajustes salariais, pisos, percentuais de HE e benefícios ao longo dos anos, destacando alterações com badge "ALTERAÇÃO".
-- **Modelo de IA e Métricas:** Cards com arquitetura (Legal-BERT fine-tuned), Precisão, Recall, F1-Score e tempo médio de processamento por CCT.
+- **Comparativo Histórico de Regras:** Timeline mostrando evolução de reajustes salariais, pisos, percentuais de HE e benefícios ao longo dos anos.
+- **Validação Semântica de Jornada:** Cláusulas "jornada semanal"/"carga horária" com números (30/40/44) reportados e comparados (não-bloqueante) contra `dim_cct_rule_version.standard_weekly_hours`.
 
 ---
 
@@ -484,7 +496,7 @@ A interface foi intencionalmente projetada para parecer uma **plataforma corpora
 | **Visualização & Frontend** | Dash, Plotly, dash-bootstrap-components |
 | **Modelagem Analítica** | Star Schema, SCD2, Fatos mensais, Dimensões corporativas |
 | **Qualidade & Governança** | Regras SQL/Pandas, JSON Catalog, Data Lineage, Manifestos de auditoria |
-| **IA / NLP** | Extração de entidades, classificação de regras, interpretação de CCTs |
+| **IA / NLP** | Extração offline de cláusulas de CCT (pypdf + regex rules), classificação por categoria, validação semântica de jornada — sem LLM, sem APIs externas |
 | **Infraestrutura** | Docker, Docker Compose, Makefile (local), planejado: GCP/AWS |
 | **Testes** | pytest, testes de contrato e integridade |
 
@@ -506,6 +518,10 @@ python pipelines/bronze_to_silver.py
 python pipelines/silver_to_gold.py
 python pipelines/validation_engine.py
 python pipelines/governance.py
+
+# Extrator NLP offline das CCTs reais (gera data/gold/governance/cct_extracted_rules.json)
+# Requer os PDFs reais em Docs/CCTs/ (gitignored) e pypdf
+python pipelines/nlp/cct_extractor.py
 
 # 3. Iniciar dashboards
 python app/main.py
@@ -546,6 +562,7 @@ make docker-up    # inicialização via Docker
 - `pipelines/silver_to_gold.py`: modela camada analítica (gold)
 - `pipelines/validation_engine.py`: executa as regras trabalhistas de validação
 - `pipelines/governance.py`: executa checks de qualidade e governança
+- `pipelines/nlp/cct_extractor.py`: extrai cláusulas reais dos PDFs de CCT (pypdf + regex, offline)
 - `pipelines/run_pipeline.py`: orquestra todas as etapas acima em sequência
 
 ---
@@ -562,18 +579,20 @@ make docker-up    # inicialização via Docker
 
 ---
 
-## 15. Extensibilidade
+## 15. Roadmap Planejado (NÃO implementado)
+
+Os itens abaixo são **roadmap** — nada deles roda na versão atual da plataforma. Nesta branch, orquestração é sequencial em scripts Python, execução é apenas local (Docker opcionamente) e nenhuma cloud está conectada.
 
 A plataforma foi arquitetada para evolução modular:
 
-- **Streaming em Tempo Real:** Substituição da ingestão batch por Kafka/Kinesis para marcações de ponto em tempo real
-- **Orquestração Avançada:** Migração para Dagster/Prefect/Airflow com DAGs monitoradas, retries e backfill
-- **Machine Learning:** Modelos preditivos de turnover, forecast de passivo trabalhista e detecção anômala de pagamentos
-- **Anomaly Detection:** Algoritmos estatísticos para identificar padrões de fraude e erros sistêmicos
-- **Forecasting Engines:** Projeção de passivo futuro com base em cenários de admissão/demissão e inflação salarial
-- **Alertas Institucionais:** Integração com Slack, Email e PagerDuty para notificações de criticidade
-- **Cloud Deployment:** Deploy em GCP (BigQuery + Cloud Run) ou AWS (Redshift + ECS) com processamento distribuído
-- **Otimização de Portfólio de Pessoas:** Aplicação de técnicas quantitativas de otimização na alocação de equipes por unidade e projeto
+- **Streaming em Tempo Real (planejado):** Substituição da ingestão batch por Kafka/Kinesis para marcações de ponto em tempo real
+- **Orquestração Avançada (planejado):** Migração para Dagster/Prefect/Airflow com DAGs monitoradas, retries e backfill — não implementado, pipeline atual é sequencial
+- **Machine Learning (planejado):** Modelos preditivos de turnover, forecast de passivo trabalhista e detecção anômala de pagamentos
+- **Anomaly Detection (planejado):** Algoritmos estatísticos para identificar padrões de fraude e erros sistêmicos
+- **Forecasting Engines (planejado):** Projeção de passivo futuro com base em cenários de admissão/demissão e inflação salarial
+- **Alertas Institucionais (planejado):** Integração com Slack, Email e PagerDuty para notificações de criticidade
+- **Cloud Deployment (planejado):** Deploy futuro em GCP (BigQuery + Cloud Run) ou AWS (Redshift + ECS) com processamento distribuído — hoje tudo roda local (DuckDB/Dash)
+- **Otimização de Portfólio de Pessoas (planejado):** Aplicação de técnicas quantitativas de otimização na alocação de equipes por unidade e projeto
 
 ---
 
@@ -641,6 +660,13 @@ The data engineering architecture was designed to simulate a real corporate envi
 - Severity classification (Regular, Attention, Critical)
 - Automatic financial impact calculation per detected inconsistency
 
+**CCT NLP Extractor (`pipelines/nlp/cct_extractor.py`)**
+- Text extraction from the real CBA/ACT PDFs (`Docs/CCTs/`) with pypdf
+- Clause header detection (numeric `CLÁUSULA 12ª` and ordinal `CLÁUSULA DÉCIMA QUINTA`) with page traceability
+- Portuguese keyword/term-expansion regex classification into 10 labor categories
+- Non-blocking workweek semantic validation (30/40/44h) against `dim_cct_rule_version`
+- Scanned PDFs marked `source_readable: false` — no LLM, no external APIs, 100% reproducible
+
 **Governance (`pipelines/governance.py`)**
 - 53 automated quality checks (completeness, uniqueness, referential integrity, consistency, validity)
 - JSON data catalog with 5,618 lines of metadata
@@ -696,6 +722,8 @@ HR Compliance Analytics/
 │   ├── bronze_to_silver.py       # Curation and standardization
 │   ├── silver_to_gold.py         # Dimensional modeling
 │   ├── validation_engine.py      # 32 labor validation rules
+│   ├── nlp/                      # Offline clause extractor
+│   │   └── cct_extractor.py      # pypdf + regex (real CCTs)
 │   └── governance.py             # 53 data quality checks
 │
 ├── data/                         # Medallion layers
@@ -823,19 +851,22 @@ The only real source in the project. Downloaded from official union websites and
 ---
 
 ### Dashboard 06 — AI & NLP
-**Objective:** Demonstrate the Artificial Intelligence layer applied to automatic interpretation of CBAs/ACTs in PDF.
+**Objective:** Demonstrate the NLP layer for automatic clause extraction from the real CBA/ACT PDF files.
 
-**Institutional Use Case:** Labor legal, advanced compliance, innovation. Answers: "Did the AI understand the agreement correctly?"
+**Institutional Use Case:** Labor legal, advanced compliance, innovation. Answers: "Did the extractor understand the agreement correctly?"
+
+**Method — 100% offline (no LLM, no external APIs):** `pipelines/nlp/cct_extractor.py` reads the real PDFs from `Docs/CCTs/` with **pypdf**, detects clause headers (`CLÁUSULA 12ª`, `CLÁUSULA DÉCIMA QUINTA`) and classifies each clause through Portuguese keyword/term-expansion regex rules (shift, overtime, night shift, hazard pay, unhealthy conditions, hour bank, vacations, adjustments, benefits, social clauses). Reproducible output at `data/gold/governance/cct_extracted_rules.json`. Scanned PDFs (no text layer — RN/CAERN and MG 2025-2027) are marked `source_readable: false` instead of failing.
 
 **KPIs:**
-- **CBAs Processed:** Number of agreements indexed by state and validity period.
-- **Automatically Extracted Rules:** Total NLP-extracted rules with monthly variation.
-- **Average Confidence Rate:** Semi-circular gauge with extraction confidence percentage (≥90% green, 80-89% yellow, <80% red).
-- **Rules Pending Review:** Count of rules with <80% confidence awaiting human validation.
-- **Rules Extracted from CBA:** Table with Rule, Entity, Extracted Value, Confidence, Source (Clause), and Status. Allows click to review original PDF snippet.
+- **CBAs Processed:** Total of real CBA/ACT PDFs in `Docs/CCTs` by state, including readable vs. scanned counts.
+- **Automatically Extracted Clauses:** Total of real clauses extracted via pypdf + regex (workweek, add-ons, benefits, social).
+- **Average Extraction Confidence:** Gauge derived from the mean heuristic clause confidence over the real JSON (≥80% green, 60-79% yellow, <60% red).
+- **Clauses with Confidence < 80%:** Count of heuristic clauses awaiting human review.
+- **Real Clauses Extracted:** Table with clause number, title, category, confidence, and source (state/period/PDF page).
+- **HE Percentage Mentions:** Counter of 50% / 70% / 100% mentions across extracted clauses.
 - **Extracted Entities (Treemap):** Frequency visualization by category (Shift, Overtime, Night Shift, Hazard Pay, Unhealthy Pay, Adjustments, Benefits, Social Clauses).
-- **Historical Rule Comparison:** Horizontal timeline showing evolution of salary adjustments, minimum wages, OT percentages, and benefits over the years, highlighting changes with "CHANGED" badge.
-- **AI Model & Metrics:** Cards with architecture (Legal-BERT fine-tuned), Precision, Recall, F1-Score, and average processing time per CBA.
+- **Historical Rule Comparison:** Timeline showing evolution of salary adjustments, minimum wages, OT percentages, and benefits over the years.
+- **Workweek Semantic Validation:** "weekly hours"/"carga horária" clauses with numbers (30/40/44) reported and compared (non-blocking) against `dim_cct_rule_version.standard_weekly_hours`.
 
 ---
 
@@ -1027,7 +1058,7 @@ The interface was intentionally designed to look like a **corporate risk monitor
 | **Visualization & Frontend** | Dash, Plotly, dash-bootstrap-components |
 | **Analytical Modeling** | Star Schema, SCD2, monthly facts, corporate dimensions |
 | **Quality & Governance** | SQL/Pandas rules, JSON Catalog, Data Lineage, Audit manifests |
-| **AI / NLP** | Entity extraction, rule classification, CBA interpretation |
+| **AI / NLP** | Offline CCT clause extraction (pypdf + regex rules), category classification, workweek semantic validation — no LLM, no external APIs |
 | **Infrastructure** | Docker, Docker Compose, Makefile (local), planned: GCP/AWS |
 | **Testing** | pytest, contract and integrity tests |
 
@@ -1049,6 +1080,10 @@ python pipelines/bronze_to_silver.py
 python pipelines/silver_to_gold.py
 python pipelines/validation_engine.py
 python pipelines/governance.py
+
+# Offline CCT NLP extractor (generates data/gold/governance/cct_extracted_rules.json)
+# Requires the real PDFs in Docs/CCTs/ (gitignored) and pypdf
+python pipelines/nlp/cct_extractor.py
 
 # 3. Start dashboards
 python app/main.py
@@ -1089,6 +1124,7 @@ make docker-up    # launch via Docker
 - `pipelines/silver_to_gold.py`: builds the analytical gold layer
 - `pipelines/validation_engine.py`: runs labor compliance validation rules
 - `pipelines/governance.py`: runs data quality and governance checks
+- `pipelines/nlp/cct_extractor.py`: extracts real clauses from CCT PDFs (pypdf + regex, offline)
 - `pipelines/run_pipeline.py`: orchestrates all steps above sequentially
 
 ---
@@ -1105,18 +1141,20 @@ make docker-up    # launch via Docker
 
 ---
 
-## 15. Extensibility
+## 15. Roadmap — Planned (NOT implemented)
+
+All items below are **roadmap** — none of them runs in the current version of the platform. On this branch, orchestration is sequential Python scripts, execution is local-only (Docker optionally) and no cloud is connected.
 
 The platform was architected for modular evolution:
 
-- **Real-Time Streaming:** Replacing batch ingestion with Kafka/Kinesis for real-time time-clock events
-- **Advanced Orchestration:** Migration to Dagster/Prefect/Airflow with monitored DAGs, retries, and backfill
-- **Machine Learning:** Predictive models for turnover, labor liability forecasting, and anomalous payment detection
-- **Anomaly Detection:** Statistical algorithms to identify fraud patterns and systemic errors
-- **Forecasting Engines:** Future liability projection based on hire/termination scenarios and salary inflation
-- **Institutional Alerting:** Integration with Slack, Email, and PagerDuty for criticality notifications
-- **Cloud Deployment:** Deploy to GCP (BigQuery + Cloud Run) or AWS (Redshift + ECS) with distributed processing
-- **Workforce Portfolio Optimization:** Application of quantitative optimization techniques for team allocation by unit and project
+- **Real-Time Streaming (planned):** Replacing batch ingestion with Kafka/Kinesis for real-time time-clock events
+- **Advanced Orchestration (planned):** Migration to Dagster/Prefect/Airflow with monitored DAGs, retries, and backfill — not implemented; the current pipeline is sequential
+- **Machine Learning (planned):** Predictive models for turnover, labor liability forecasting, and anomalous payment detection
+- **Anomaly Detection (planned):** Statistical algorithms to identify fraud patterns and systemic errors
+- **Forecasting Engines (planned):** Future liability projection based on hire/termination scenarios and salary inflation
+- **Institutional Alerting (planned):** Integration with Slack, Email, and PagerDuty for criticality notifications
+- **Cloud Deployment (planned):** Future deploy to GCP (BigQuery + Cloud Run) or AWS (Redshift + ECS) with distributed processing — today everything runs locally (DuckDB/Dash)
+- **Workforce Portfolio Optimization (planned):** Application of quantitative optimization techniques for team allocation by unit and project
 
 ---
 
