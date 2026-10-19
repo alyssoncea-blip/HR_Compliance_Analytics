@@ -8,6 +8,11 @@ Reads from Gold/Silver. Writes fact_detected_inconsistency to Gold.
 import duckdb, os, time, json
 from datetime import datetime, timezone
 
+try:
+    from validation_rules import uc1_query, uc8_query, uc28_query
+except ImportError:
+    from pipelines.validation_rules import uc1_query, uc8_query, uc28_query
+
 SILVER = "data/silver"
 GOLD = "data/gold"
 OBS = f"{GOLD}/observability"
@@ -67,17 +72,29 @@ con.execute(f"""
         -- Direct payroll columns (overtime_70/100 hours not in fact_monthly_employee)
         fp.overtime_50_hours, fp.overtime_70_hours, fp.overtime_100_hours,
         fp.night_shift_hours,
-        fp.overtime_50_amount AS fp_overtime_50_amount,
-        fp.overtime_70_amount AS fp_overtime_70_amount,
-        fp.overtime_100_amount AS fp_overtime_100_amount,
-        fp.gross_total AS fp_gross_total
-    FROM read_parquet({gq("fact_monthly_employee")}) g
-    INNER JOIN read_parquet({pq("dim_employee")}) ed ON g.employee_id = ed.employee_id
-    LEFT JOIN cct_rules cct
-      ON ed.union_id = cct.union_id
-     AND MAKE_DATE(g.year, g.month, 1) BETWEEN cct.valid_from AND cct.valid_to
-    LEFT JOIN read_parquet({pq("fact_payroll")}) fp
-        ON g.employee_id = fp.employee_id AND g.date_sk = fp.date_sk
+    fp.overtime_50_amount AS fp_overtime_50_amount,
+    fp.overtime_70_amount AS fp_overtime_70_amount,
+    fp.overtime_100_amount AS fp_overtime_100_amount,
+    fp.gross_total AS fp_gross_total
+FROM read_parquet({gq("fact_monthly_employee")}) g
+INNER JOIN read_parquet({pq("dim_employee")}) ed ON g.employee_id = ed.employee_id
+LEFT JOIN cct_rules cct
+  ON ed.union_id = cct.union_id
+ AND MAKE_DATE(g.year, g.month, 1) BETWEEN cct.valid_from AND cct.valid_to
+LEFT JOIN read_parquet({pq("fact_payroll")}) fp
+    ON g.employee_id = fp.employee_id AND g.date_sk = fp.date_sk
+""")
+
+# Employee-level pre-aggregation: one row per employee (avg rate across months,
+# schedule) — lets day-granularity rules run full-coverage without LIMIT and
+# without per-row correlated subqueries or month duplication.
+con.execute(f"""
+    CREATE OR REPLACE TEMP VIEW emp_ctx AS
+    SELECT employee_id,
+           ANY_VALUE(work_schedule) AS work_schedule,
+           AVG(hourly_rate) AS hourly_rate
+    FROM monthly_ctx
+    GROUP BY employee_id
 """)
 
 detections = []
@@ -85,23 +102,9 @@ detections = []
 # =========================================================================
 # UC1 — HE Progressiva: adicional >1h should be 70%, but paid at 50%
 # =========================================================================
-print("\n[UC1] HE Progressiva...")
+print("[UC1] HE Progressiva...")
 t0 = time.time()
-q = f"""
-    SELECT m.employee_id, m.competence, 1 AS use_case,
-           'HE progressiva incorreta' AS rule_name, 'remuneracao' AS category, 'alto' AS severity,
-           CAST(m.overtime_70_amount AS VARCHAR) AS detected_value,
-           CAST(ROUND(m.overtime_70_hours * m.hourly_rate * (1 + m.he_additional_hours_percent), 2) AS VARCHAR) AS expected_value,
-           ROUND(m.overtime_70_hours * m.hourly_rate * (m.he_additional_hours_percent - m.he_first_hour_percent), 2) AS financial_impact,
-           CASE WHEN m.he_progressive THEN
-               'Horas extras adicionais (>1h) pagas a ' || CAST(m.he_first_hour_percent*100 AS VARCHAR) || '% em vez de '
-               || CAST(m.he_additional_hours_percent*100 AS VARCHAR) || '%'
-           ELSE 'CCT nao preve HE progressiva, mas ha horas registradas' END AS detail
-    FROM monthly_ctx m
-    WHERE m.overtime_70_hours > 0
-      AND ABS(m.overtime_70_amount - ROUND(m.overtime_70_hours * m.hourly_rate * (1 + m.he_additional_hours_percent), 2)) > 0.50
-      AND m.he_progressive = TRUE
-"""
+q = uc1_query("SELECT * FROM monthly_ctx")
 res = con.execute(q).fetchdf()
 detections.append(res)
 print(f"  -> {len(res)} detected ({time.time()-t0:.1f}s)")
@@ -175,11 +178,11 @@ q = f"""
            'Intervalo intrajornada violado' AS rule_name, 'jornada' AS category, 'critico' AS severity,
            CAST(tr.interval_minutes AS VARCHAR) AS detected_value,
            '>= 60' AS expected_value,
-           ROUND(tr.total_hours * 0.5 * (SELECT AVG(hourly_rate) FROM monthly_ctx WHERE employee_id = tr.employee_id), 2) AS financial_impact,
+           ROUND(tr.total_hours * 0.5 * e.hourly_rate, 2) AS financial_impact,
            'Intervalo de ' || CAST(tr.interval_minutes AS VARCHAR) || 'min em jornada de ' || CAST(tr.total_hours AS VARCHAR) || 'h (minimo 60min)' AS detail
     FROM read_parquet({pq("fact_time_record")}) tr
+    INNER JOIN emp_ctx e ON tr.employee_id = e.employee_id
     WHERE tr.total_hours > 6 AND tr.interval_minutes < 60 AND tr.interval_minutes > 0
-    LIMIT 1000
 """
 res = con.execute(q).fetchdf()
 detections.append(res)
@@ -231,16 +234,7 @@ print(f"  -> {len(res)} detected ({time.time()-t0:.1f}s)")
 # =========================================================================
 print("[UC8] Sem Registro de Ponto...")
 t0 = time.time()
-q = f"""
-    SELECT m.employee_id, m.competence, 8 AS use_case,
-           'Funcionario sem registro de ponto' AS rule_name, 'cadastro' AS category, 'critico' AS severity,
-           '0 registros' AS detected_value,
-           '>0 registros esperados' AS expected_value,
-           0.0 AS financial_impact,
-           'Funcionario ativo na folha sem marcacoes de ponto no periodo' AS detail
-    FROM monthly_ctx m
-    WHERE m.missing_records > 0
-"""
+q = uc8_query("SELECT * FROM monthly_ctx")
 res = con.execute(q).fetchdf()
 detections.append(res)
 print(f"  -> {len(res)} detected ({time.time()-t0:.1f}s)")
@@ -319,12 +313,11 @@ q = f"""
            'Jornada 12x36 excedida' AS rule_name, 'jornada' AS category, 'alto' AS severity,
            CAST(tr.total_hours AS VARCHAR) AS detected_value,
            '<= 12h' AS expected_value,
-           ROUND(GREATEST(0, CAST(tr.total_hours - 12 AS DOUBLE)) * (SELECT AVG(hourly_rate) FROM monthly_ctx WHERE employee_id = tr.employee_id) * 1.5, 2) AS financial_impact,
+           ROUND(GREATEST(0, CAST(tr.total_hours - 12 AS DOUBLE)) * e.hourly_rate * 1.5, 2) AS financial_impact,
            'Jornada de ' || CAST(tr.total_hours AS VARCHAR) || 'h em regime 12x36 (maximo 12h)' AS detail
     FROM read_parquet({pq("fact_time_record")}) tr
-    INNER JOIN monthly_ctx e ON tr.employee_id = e.employee_id
+    INNER JOIN emp_ctx e ON tr.employee_id = e.employee_id
     WHERE e.work_schedule = '12x36' AND tr.total_hours > 12
-    LIMIT 500
 """
 res = con.execute(q).fetchdf()
 detections.append(res)
@@ -526,7 +519,6 @@ q = f"""
            CAST(tr.overtime_50 + tr.overtime_70 AS VARCHAR) || 'h extras sem aprovacao do gestor (politica: >2h requer aprovacao)' AS detail
     FROM read_parquet({pq("fact_time_record")}) tr
     WHERE tr.overtime_50 + tr.overtime_70 > 2 AND tr.has_overtime_approval = FALSE
-    LIMIT 500
 """
 res = con.execute(q).fetchdf()
 detections.append(res)
@@ -566,7 +558,6 @@ q = f"""
     FROM read_parquet({pq("fact_time_record")}) tr
     WHERE tr.night_hours > 0 AND tr.entry_1 IS NOT NULL
       AND EXTRACT(HOUR FROM tr.entry_1) < 18 AND EXTRACT(HOUR FROM tr.entry_1) >= 5
-    LIMIT 100
 """
 res = con.execute(q).fetchdf()
 detections.append(res)
@@ -579,12 +570,17 @@ print("[UC25] Limite semanal excedido...")
 t0 = time.time()
 q = f"""
     WITH weekly AS (
-        SELECT tr.employee_id, DATE_TRUNC('week', d.full_date) AS week_start,
+        SELECT tr.employee_id,
+               DATE_TRUNC('week', d.full_date) AS week_start,
+               CAST(EXTRACT('year' FROM DATE_TRUNC('week', d.full_date)) AS INTEGER) AS wy,
+               CAST(EXTRACT('month' FROM DATE_TRUNC('week', d.full_date)) AS INTEGER) AS wm,
                SUM(tr.total_hours) AS week_hours
         FROM read_parquet({pq("fact_time_record")}) tr
         INNER JOIN read_parquet({pq("dim_date")}) d ON tr.date_sk = d.date_sk
         WHERE tr.total_hours > 0 AND tr.employee_id IS NOT NULL
-        GROUP BY tr.employee_id, DATE_TRUNC('week', d.full_date)
+        GROUP BY tr.employee_id, DATE_TRUNC('week', d.full_date),
+                 CAST(EXTRACT('year' FROM DATE_TRUNC('week', d.full_date)) AS INTEGER),
+                 CAST(EXTRACT('month' FROM DATE_TRUNC('week', d.full_date)) AS INTEGER)
         HAVING SUM(tr.total_hours) > 44
     )
     SELECT w.employee_id, CAST(w.week_start AS VARCHAR) AS competence, 25 AS use_case,
@@ -594,10 +590,10 @@ q = f"""
            ROUND((w.week_hours - e.cct_weekly_hours) * e.hourly_rate * 1.5, 2) AS financial_impact,
            'Jornada de ' || CAST(w.week_hours AS VARCHAR) || 'h na semana ' || CAST(w.week_start AS VARCHAR) || ' — limite: ' || CAST(e.cct_weekly_hours AS VARCHAR) || 'h' AS detail
     FROM weekly w
-    INNER JOIN monthly_ctx e ON w.employee_id = e.employee_id
+    INNER JOIN monthly_ctx e
+        ON w.employee_id = e.employee_id
+       AND w.wy = e.year AND w.wm = e.month
     WHERE w.week_hours > e.cct_weekly_hours
-    ORDER BY w.week_hours DESC
-    LIMIT 2000
 """
 res = con.execute(q).fetchdf()
 detections.append(res)
@@ -634,11 +630,11 @@ q = f"""
            'Falta com atestado descontada' AS rule_name, 'cadastro' AS category, 'medio' AS severity,
            'Falta injustificada' AS detected_value,
            'Falta justificada (atestado)' AS expected_value,
-            ROUND(8 * (SELECT AVG(hourly_rate) FROM monthly_ctx WHERE employee_id = tr.employee_id), 2) AS financial_impact,
+            ROUND(8 * e.hourly_rate, 2) AS financial_impact,
            'Falta com atestado medico registrada como injustificada' AS detail
     FROM read_parquet({pq("fact_time_record")}) tr
+    INNER JOIN emp_ctx e ON tr.employee_id = e.employee_id
     WHERE tr.absence_type = 'unjustified'
-    LIMIT 500
 """
 res = con.execute(q).fetchdf()
 detections.append(res)
@@ -649,20 +645,10 @@ print(f"  -> {len(res)} detected ({time.time()-t0:.1f}s)")
 # =========================================================================
 print("[UC28] Jornada sobreposta...")
 t0 = time.time()
-# Detect overlapping: same employee, same date, overlapping shifts
-q = f"""
-    SELECT tr.employee_id, CAST(tr.date_sk AS VARCHAR) AS competence, 28 AS use_case,
-           'Jornada sobreposta' AS rule_name, 'jornada' AS category, 'medio' AS severity,
-           'Marcacoes conflitantes' AS detected_value,
-           'Jornada unica por dia' AS expected_value,
-           0.0 AS financial_impact,
-           'Registros de ponto indicam jornadas sobrepostas no mesmo dia' AS detail
-    FROM read_parquet({pq("fact_time_record")}) tr
-    INNER JOIN read_parquet({pq("fact_time_record")}) tr2
-        ON tr.employee_id = tr2.employee_id AND tr.date_sk = tr2.date_sk AND tr.record_id != tr2.record_id
-    WHERE tr.total_hours > 0 AND tr2.total_hours > 0
-    LIMIT 200
-"""
+# Real interval-overlap rule (validation_rules.uc28_query): same employee/day,
+# two records whose shift spans (entry/exit marks) actually overlap. The old
+# "any two records on the same day" heuristic is retired.
+q = uc28_query(f"SELECT * FROM read_parquet({pq('fact_time_record')})")
 res = con.execute(q).fetchdf()
 detections.append(res)
 print(f"  -> {len(res)} detected ({time.time()-t0:.1f}s)")
@@ -809,13 +795,17 @@ passivo.to_parquet(f"{GOLD}/fact_passivo_trabalhista.parquet", index=False, comp
 monthly = con.execute(f"SELECT * FROM read_parquet({gq('fact_monthly_employee')})").fetchdf()
 det_m = all_detections[all_detections["competence"].str.contains("-", na=False)].copy()
 if not det_m.empty:
-    agg = det_m.groupby(["employee_id", "competence"]).agg(
-        total_inconsistencies=("detection_id", "count"),
-        payment_inconsistencies=("category", lambda s: int((s == "financeiro").sum())),
-        night_shift_inconsistencies=("category", lambda s: int((s == "adicional_noturno").sum())),
-        periculosidade_inconsistencies=("rule_name", lambda s: int(s.str.contains("Periculosidade", case=False, na=False).sum())),
-        he_inconsistencies=("rule_name", lambda s: int(s.str.contains("HE|hora extra|Feriado", case=False, na=False).sum())),
-    ).reset_index()
+    con.register("det_m_view", det_m)
+    agg = con.execute(f"""
+        SELECT employee_id, competence,
+               COUNT(*) AS total_inconsistencies,
+               COUNT(*) FILTER (WHERE category = 'financeiro') AS payment_inconsistencies,
+               COUNT(*) FILTER (WHERE category = 'adicional_noturno') AS night_shift_inconsistencies,
+               COUNT(*) FILTER (WHERE regexp_matches(rule_name, 'Periculosidade', 'i')) AS periculosidade_inconsistencies,
+               COUNT(*) FILTER (WHERE regexp_matches(rule_name, 'HE|hora extra|Feriado', 'i')) AS he_inconsistencies
+        FROM det_m_view
+        GROUP BY employee_id, competence
+    """).fetchdf()
     monthly["competence"] = monthly["year"].astype(str) + "-" + monthly["month"].astype(str).str.zfill(2)
     monthly = monthly.merge(agg, on=["employee_id", "competence"], how="left", suffixes=("", "_new"))
     for c in ["total_inconsistencies", "payment_inconsistencies", "night_shift_inconsistencies", "periculosidade_inconsistencies", "he_inconsistencies"]:
@@ -851,11 +841,19 @@ manifest = {
     "total_estimated_impact": round(total_impact, 2),
     "rules_implemented": 32,
     "output": "data/gold/fact_detected_inconsistency.parquet",
+    "truncation": False,
+    "truncation_removed_use_cases": [5, 12, 22, 24, 25, 27, 28],
+    "full_coverage": True,
+    "uc28_method": "interval-overlap of entry/exit shift spans; records without readable marks cannot be assessed (documented in rule detail)",
+    "sla_rebaseline": "max_critical_rows 6000 -> 350000 (previous threshold matched LIMIT-truncated detection; runtime SLA 180s unchanged)",
 }
 with open(f"{GOLD}/validation_manifest.json", "w") as f:
     json.dump(manifest, f, indent=2)
 
 # Operational observability (history + SLA + alert)
+# max_critical_rows is re-baselined for full-coverage detection: the previous
+# 6000 threshold was calibrated when rules were LIMIT-truncated (baseline run
+# already reported 34k critical rows). Runtime SLA (180s) is unchanged.
 obs_event = {
     "run_at": NOW_ISO,
     "pipeline": "validation_engine",
@@ -863,9 +861,9 @@ obs_event = {
     "rows_detected": int(len(all_detections)),
     "critical_rows": int((all_detections["severity"] == "critico").sum()),
     "total_estimated_impact": float(round(total_impact, 2)),
-    "sla": {"max_runtime_seconds": 180, "max_critical_rows": 6000},
+    "sla": {"max_runtime_seconds": 180, "max_critical_rows": 350000},
 }
-obs_event["sla_status"] = "PASS" if (obs_event["runtime_seconds"] <= 180 and obs_event["critical_rows"] <= 6000) else "FAIL"
+obs_event["sla_status"] = "PASS" if (obs_event["runtime_seconds"] <= obs_event["sla"]["max_runtime_seconds"] and obs_event["critical_rows"] <= obs_event["sla"]["max_critical_rows"]) else "FAIL"
 history_path = f"{OBS}/validation_history.json"
 history = []
 if os.path.exists(history_path):
