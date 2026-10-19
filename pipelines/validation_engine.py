@@ -5,13 +5,21 @@ inconsistencies with calculated financial impact.
 
 Reads from Gold/Silver. Writes fact_detected_inconsistency to Gold.
 """
-import duckdb, os, time, json
+import argparse, duckdb, os, sys, time, json
 from datetime import datetime, timezone
 
 try:
     from validation_rules import uc1_query, uc8_query, uc28_query
+    from competence_utils import (
+        CONTRACT_COLS, normalize_competence, list_competences,
+        resolve_requested_competences, merge_detections,
+    )
 except ImportError:
     from pipelines.validation_rules import uc1_query, uc8_query, uc28_query
+    from pipelines.competence_utils import (
+        CONTRACT_COLS, normalize_competence, list_competences,
+        resolve_requested_competences, merge_detections,
+    )
 
 SILVER = "data/silver"
 GOLD = "data/gold"
@@ -22,6 +30,68 @@ os.makedirs(GOLD, exist_ok=True)
 os.makedirs(OBS, exist_ok=True)
 con = duckdb.connect()
 
+parser = argparse.ArgumentParser(description="Validation engine - 32 labor rules")
+parser.add_argument("--competence", action="append", metavar="YYYY-MM", default=None,
+                    help="competence to (re)process, repeatable")
+parser.add_argument("--competence-from", dest="competence_from", metavar="YYYY-MM", default=None,
+                    help="inclusive lower bound of competence range")
+parser.add_argument("--competence-to", dest="competence_to", metavar="YYYY-MM", default=None,
+                    help="inclusive upper bound of competence range")
+args = parser.parse_args()
+
+AVAILABLE_COMPETENCES = list_competences(con, GOLD)
+try:
+    TARGETS = resolve_requested_competences(
+        args.competence, args.competence_from, args.competence_to, AVAILABLE_COMPETENCES
+    )
+except ValueError as e:
+    sys.stderr.write(f"[argument error] {e}\n")
+    sys.exit(2)
+PARTITIONED = TARGETS is not None
+MONTH_SET = "(" + ",".join(f"'{c}'" for c in TARGETS) + ")" if PARTITIONED else None
+
+# SLA basis: full-run thresholds; partitioned runs scale proportionally to the
+# fraction of competences processed with generous floors (documented in prod).
+FULL_SLA_RUNTIME, FULL_SLA_CRITICAL = 180, 350_000
+if PARTITIONED:
+    _frac = len(TARGETS) / max(1, len(AVAILABLE_COMPETENCES))
+    SLA_RUNTIME = max(60.0, round(FULL_SLA_RUNTIME * _frac, 1))
+    SLA_CRITICAL = max(2000, int(round(FULL_SLA_CRITICAL * _frac)))
+    SLA_POLICY = (
+        f"partitioned: thresholds scaled by the fraction of competences processed "
+        f"({len(TARGETS)}/{len(AVAILABLE_COMPETENCES)}), floor 60s runtime / 2000 critical rows; "
+        f"full-run threshold is {FULL_SLA_RUNTIME}s / {FULL_SLA_CRITICAL} critical rows"
+    )
+else:
+    SLA_RUNTIME, SLA_CRITICAL = FULL_SLA_RUNTIME, FULL_SLA_CRITICAL
+    SLA_POLICY = f"full run: fixed thresholds ({FULL_SLA_RUNTIME}s runtime, {FULL_SLA_CRITICAL} critical rows)"
+
+# Row-scope predicates (empty strings in full mode -> SQL unchanged)
+_scope_where_g = ""
+_scope_tr = ""
+_scope_tr_util = ""
+_scope_pay_bp = ""
+_scope_pay_raw = ""
+_scope_sh = ""
+_scope_vac = ""
+if PARTITIONED:
+    _scope_where_g = f"""
+     WHERE g.year || '-' || LPAD(CAST(g.month AS VARCHAR), 2, '0') IN {MONTH_SET}"""
+    _scope_tr = f"""
+      AND SUBSTR(CAST(tr.date_sk AS VARCHAR), 1, 4) || '-' || SUBSTR(CAST(tr.date_sk AS VARCHAR), 5, 2) IN {MONTH_SET}"""
+    _scope_tr_util = f"""
+           SUBSTR(CAST(date_sk AS VARCHAR), 1, 4) || '-' || SUBSTR(CAST(date_sk AS VARCHAR), 5, 2) IN {MONTH_SET}"""
+    _scope_pay_bp = f"""
+        AND CAST(bp.year AS VARCHAR) || '-' || LPAD(CAST(bp.month AS VARCHAR), 2, '0') IN {MONTH_SET}"""
+    _scope_pay_raw = f"""
+        WHERE CAST(year AS VARCHAR) || '-' || LPAD(CAST(month AS VARCHAR), 2, '0') IN {MONTH_SET}"""
+    _scope_sh = f"""
+      AND SUBSTR(CAST(sh.effective_date AS VARCHAR), 1, 7) IN {MONTH_SET}"""
+    _scope_vac = f"""
+      AND SUBSTR(CAST(v.concession_deadline AS VARCHAR), 1, 7) IN {MONTH_SET}"""
+
+
+
 def pq(path): return f"'{SILVER}/{path}.parquet'".replace(chr(92), "/")
 def gq(path): return f"'{GOLD}/{path}.parquet'".replace(chr(92), "/")
 def bq(path): return f"'{BRONZE}/{path}.parquet'".replace(chr(92), "/") if 'BRONZE' in dir() else f"'data/bronze/{path}.parquet'".replace(chr(92), "/")
@@ -30,7 +100,7 @@ def bq(path): return f"'{BRONZE}/{path}.parquet'".replace(chr(92), "/") if 'BRON
 # Build hourly rate and CCT rules context
 # -------------------------------------------------------------------
 print("=" * 60)
-print("VALIDATION ENGINE — 32 RULES")
+print(f"VALIDATION ENGINE — 32 RULES  (mode: {'partitioned ' + str(TARGETS) if PARTITIONED else 'full'})")
 print("=" * 60)
 
 t_start = time.time()
@@ -83,17 +153,34 @@ LEFT JOIN cct_rules cct
  AND MAKE_DATE(g.year, g.month, 1) BETWEEN cct.valid_from AND cct.valid_to
 LEFT JOIN read_parquet({pq("fact_payroll")}) fp
     ON g.employee_id = fp.employee_id AND g.date_sk = fp.date_sk
+{_scope_where_g}
 """)
 
 # Employee-level pre-aggregation: one row per employee (avg rate across months,
 # schedule) — lets day-granularity rules run full-coverage without LIMIT and
 # without per-row correlated subqueries or month duplication.
+# Built from the UNscoped context: employee attributes are month-independent,
+# so partitioned runs keep the same employee/rate base as a full run.
+con.execute(f"""
+    CREATE OR REPLACE TEMP VIEW monthly_ctx_full AS
+    SELECT
+        g.employee_id,
+        g.year || '-' || LPAD(CAST(g.month AS VARCHAR), 2, '0') AS competence,
+        g.base_salary,
+        ed.weekly_hours, ed.work_schedule,
+        cct.standard_weekly_hours AS cct_weekly_hours
+    FROM read_parquet({gq("fact_monthly_employee")}) g
+    INNER JOIN read_parquet({pq("dim_employee")}) ed ON g.employee_id = ed.employee_id
+    LEFT JOIN cct_rules cct
+      ON ed.union_id = cct.union_id
+     AND MAKE_DATE(g.year, g.month, 1) BETWEEN cct.valid_from AND cct.valid_to
+""")
 con.execute(f"""
     CREATE OR REPLACE TEMP VIEW emp_ctx AS
     SELECT employee_id,
            ANY_VALUE(work_schedule) AS work_schedule,
-           AVG(hourly_rate) AS hourly_rate
-    FROM monthly_ctx
+           AVG(ROUND(base_salary / (NULLIF(weekly_hours, 0) * 4.33), 4)) AS hourly_rate
+    FROM monthly_ctx_full
     GROUP BY employee_id
 """)
 
@@ -183,6 +270,7 @@ q = f"""
     FROM read_parquet({pq("fact_time_record")}) tr
     INNER JOIN emp_ctx e ON tr.employee_id = e.employee_id
     WHERE tr.total_hours > 6 AND tr.interval_minutes < 60 AND tr.interval_minutes > 0
+    {_scope_tr}
 """
 res = con.execute(q).fetchdf()
 detections.append(res)
@@ -318,6 +406,7 @@ q = f"""
     FROM read_parquet({pq("fact_time_record")}) tr
     INNER JOIN emp_ctx e ON tr.employee_id = e.employee_id
     WHERE e.work_schedule = '12x36' AND tr.total_hours > 12
+    {_scope_tr}
 """
 res = con.execute(q).fetchdf()
 detections.append(res)
@@ -416,9 +505,12 @@ q = f"""
     FROM read_parquet({bq("audit/inconsistency_log")}) i
     WHERE i.use_case = 17
 """
-res = con.execute(q).fetchdf()
-detections.append(res)
-print(f"  -> {len(res)} detected ({time.time()-t0:.1f}s)")
+if PARTITIONED:
+    print("  -> skipped (partitioned mode: N/A-competence rows preserved from prior runs)")
+else:
+    res = con.execute(q).fetchdf()
+    detections.append(res)
+    print(f"  -> {len(res)} detected ({time.time()-t0:.1f}s)")
 
 # =========================================================================
 # UC18 — Pagamento Orfao
@@ -436,6 +528,7 @@ q = f"""
     LEFT JOIN read_parquet({pq("fact_payroll")}) p
         ON bp.employee_id = p.employee_id AND bp.year = p.year AND bp.month = p.month
     WHERE p.payroll_id IS NULL AND bp.expected_amount = 0 AND bp.paid_amount > 0
+    {_scope_pay_bp}
 """
 res = con.execute(q).fetchdf()
 detections.append(res)
@@ -456,9 +549,12 @@ q = f"""
     FROM read_parquet({pq("dim_employee")}) e
     WHERE e.union_id IS NULL
 """
-res = con.execute(q).fetchdf()
-detections.append(res)
-print(f"  -> {len(res)} detected ({time.time()-t0:.1f}s)")
+if PARTITIONED:
+    print("  -> skipped (partitioned mode: N/A-competence rows preserved from prior runs)")
+else:
+    res = con.execute(q).fetchdf()
+    detections.append(res)
+    print(f"  -> {len(res)} detected ({time.time()-t0:.1f}s)")
 
 # =========================================================================
 # UC20 — Escala Incompativel com Convencao
@@ -476,9 +572,12 @@ q = f"""
     INNER JOIN read_parquet({pq("dim_union")}) u ON e.union_id = u.union_id
     WHERE u.state = 'RN' AND e.work_schedule = '6x1'
 """
-res = con.execute(q).fetchdf()
-detections.append(res)
-print(f"  -> {len(res)} detected ({time.time()-t0:.1f}s)")
+if PARTITIONED:
+    print("  -> skipped (partitioned mode: N/A-competence rows preserved from prior runs)")
+else:
+    res = con.execute(q).fetchdf()
+    detections.append(res)
+    print(f"  -> {len(res)} detected ({time.time()-t0:.1f}s)")
 
 # =========================================================================
 # UC21 — Pagamento Duplicado
@@ -490,6 +589,7 @@ q = f"""
         SELECT employee_id, year, month, receipt_code, COUNT(*) AS cnt,
                SUM(paid_amount) AS total_paid
         FROM read_parquet({pq("fact_payment")})
+        {_scope_pay_raw}
         GROUP BY employee_id, year, month, receipt_code
         HAVING COUNT(*) > 1
     )
@@ -519,6 +619,7 @@ q = f"""
            CAST(tr.overtime_50 + tr.overtime_70 AS VARCHAR) || 'h extras sem aprovacao do gestor (politica: >2h requer aprovacao)' AS detail
     FROM read_parquet({pq("fact_time_record")}) tr
     WHERE tr.overtime_50 + tr.overtime_70 > 2 AND tr.has_overtime_approval = FALSE
+    {_scope_tr}
 """
 res = con.execute(q).fetchdf()
 detections.append(res)
@@ -538,6 +639,7 @@ q = f"""
            'Promocao em ' || CAST(sh.effective_date AS VARCHAR) || ' sem alteracao salarial (R$' || CAST(sh.previous_salary AS VARCHAR) || ')' AS detail
     FROM read_parquet({pq("salary_history")}) sh
     WHERE sh.previous_salary = sh.new_salary AND sh.change_reason = 'promotion'
+    {_scope_sh}
 """
 res = con.execute(q).fetchdf()
 detections.append(res)
@@ -558,6 +660,7 @@ q = f"""
     FROM read_parquet({pq("fact_time_record")}) tr
     WHERE tr.night_hours > 0 AND tr.entry_1 IS NOT NULL
       AND EXTRACT(HOUR FROM tr.entry_1) < 18 AND EXTRACT(HOUR FROM tr.entry_1) >= 5
+    {_scope_tr}
 """
 res = con.execute(q).fetchdf()
 detections.append(res)
@@ -616,9 +719,12 @@ q = f"""
     INNER JOIN read_parquet({pq("dim_unit")}) un ON e.unit_id = un.unit_id
     WHERE u.state != un.state
 """
-res = con.execute(q).fetchdf()
-detections.append(res)
-print(f"  -> {len(res)} detected ({time.time()-t0:.1f}s)")
+if PARTITIONED:
+    print("  -> skipped (partitioned mode: N/A-competence rows preserved from prior runs)")
+else:
+    res = con.execute(q).fetchdf()
+    detections.append(res)
+    print(f"  -> {len(res)} detected ({time.time()-t0:.1f}s)")
 
 # =========================================================================
 # UC27 — Falta com Atestado Descontada
@@ -635,6 +741,7 @@ q = f"""
     FROM read_parquet({pq("fact_time_record")}) tr
     INNER JOIN emp_ctx e ON tr.employee_id = e.employee_id
     WHERE tr.absence_type = 'unjustified'
+    {_scope_tr}
 """
 res = con.execute(q).fetchdf()
 detections.append(res)
@@ -648,7 +755,10 @@ t0 = time.time()
 # Real interval-overlap rule (validation_rules.uc28_query): same employee/day,
 # two records whose shift spans (entry/exit marks) actually overlap. The old
 # "any two records on the same day" heuristic is retired.
-q = uc28_query(f"SELECT * FROM read_parquet({pq('fact_time_record')})")
+uc28_source = ("SELECT * FROM read_parquet(" + pq('fact_time_record') +
+               f") WHERE {_scope_tr_util.strip()}" if PARTITIONED else
+               f"SELECT * FROM read_parquet({pq('fact_time_record')})")
+q = uc28_query(uc28_source)
 res = con.execute(q).fetchdf()
 detections.append(res)
 print(f"  -> {len(res)} detected ({time.time()-t0:.1f}s)")
@@ -710,6 +820,7 @@ q = f"""
     FROM read_parquet({pq("vacations")}) v
     INNER JOIN read_parquet({pq("dim_employee")}) e ON v.employee_id = e.employee_id
     WHERE v.status = 'expired'
+    {_scope_vac}
 """
 res = con.execute(q).fetchdf()
 detections.append(res)
@@ -731,6 +842,7 @@ q = f"""
     FROM read_parquet({pq("vacations")}) v
     INNER JOIN read_parquet({pq("dim_employee")}) e ON v.employee_id = e.employee_id
     WHERE v.status = 'impending'
+    {_scope_vac}
 """
 res = con.execute(q).fetchdf()
 detections.append(res)
@@ -745,24 +857,45 @@ t0 = time.time()
 
 # Concatenate all detections
 import pandas as pd
-all_detections = pd.concat(detections, ignore_index=True)
-all_detections["detected_at"] = NOW_ISO
-all_detections["detection_id"] = range(1, len(all_detections) + 1)
-all_detections["rule_origin"] = "rule_engine"
-all_detections["evidence_source"] = "computed_from_cross_source"
-sim_mask = all_detections["use_case"].isin([17])
-all_detections.loc[sim_mask, "rule_origin"] = "simulation_marker"
-all_detections.loc[sim_mask, "evidence_source"] = "bronze.audit.inconsistency_log"
+new_detections = pd.concat(detections, ignore_index=True)
+new_detections["detected_at"] = NOW_ISO
+new_detections["rule_origin"] = "rule_engine"
+new_detections["evidence_source"] = "computed_from_cross_source"
+sim_mask = new_detections["use_case"].isin([17])
+new_detections.loc[sim_mask, "rule_origin"] = "simulation_marker"
+new_detections.loc[sim_mask, "evidence_source"] = "bronze.audit.inconsistency_log"
 
-# Reorder columns
-cols = ["detection_id", "employee_id", "competence", "use_case", "rule_name",
-         "category", "severity", "detected_value", "expected_value",
-        "financial_impact", "detail", "rule_origin", "evidence_source", "detected_at"]
-all_detections = all_detections[cols]
+# Merge into the stored detection set: partitioned mode reuses rows of every
+# untouched competence and renumbers the whole set deterministically.
+det_path = f"{GOLD}/fact_detected_inconsistency.parquet".replace(chr(92), "/")
+old_df = None
+prior_norm_counts = {}
+if PARTITIONED:
+    if not os.path.exists(det_path):
+        sys.exit("partitioned run requires an existing fact_detected_inconsistency.parquet (run full mode first)")
+    old_df = con.execute(f"""
+        SELECT {",".join(CONTRACT_COLS)} FROM read_parquet('{det_path}')
+    """).fetchdf()
+    prior_norm_counts = old_df["competence"].map(normalize_competence).value_counts().to_dict()
+
+all_detections = merge_detections(old_df, new_detections, TARGETS)
 
 # Write to Gold Parquet
-path = f"{GOLD}/fact_detected_inconsistency.parquet".replace(chr(92), "/")
+path = det_path
 all_detections.to_parquet(path, index=False, compression="zstd")
+
+merge_proof = None
+norm_counts = all_detections["competence"].map(normalize_competence).value_counts().to_dict()
+if PARTITIONED:
+    non_target = {k: int(v) for k, v in prior_norm_counts.items() if k not in TARGETS}
+    after_non_target = {k: int(v) for k, v in norm_counts.items() if k not in TARGETS}
+    merge_proof = {
+        "deleted_by_target": {t: int(prior_norm_counts.get(t, 0)) for t in TARGETS},
+        "final_by_target": {t: int(norm_counts.get(t, 0)) for t in TARGETS},
+        "preserved_rows": {k: after_non_target[k] for k in sorted(after_non_target)},
+        "non_target_unchanged": non_target == after_non_target,
+    }
+    del old_df, prior_norm_counts
 
 # Derive labor liability fact from detected inconsistencies
 liab_factors = con.execute(f"""
@@ -792,8 +925,21 @@ passivo = passivo[[
 passivo.to_parquet(f"{GOLD}/fact_passivo_trabalhista.parquet", index=False, compression="zstd")
 
 # Fill monthly dashboard contract columns from detections
+COUNTER_COLS = ["total_inconsistencies", "payment_inconsistencies",
+                "night_shift_inconsistencies", "periculosidade_inconsistencies",
+                "he_inconsistencies"]
 monthly = con.execute(f"SELECT * FROM read_parquet({gq('fact_monthly_employee')})").fetchdf()
-det_m = all_detections[all_detections["competence"].str.contains("-", na=False)].copy()
+monthly["competence"] = monthly["year"].astype(str) + "-" + monthly["month"].astype(str).str.zfill(2)
+if PARTITIONED:
+    # Only target competences are recomputed; untouched rows keep their values
+    monthly_mask = monthly["competence"].isin(TARGETS)
+    for c in COUNTER_COLS:
+        if c not in monthly.columns:
+            monthly[c] = 0
+        monthly.loc[monthly_mask, c] = 0
+    det_m = all_detections[all_detections["competence"].isin(TARGETS)].copy()
+else:
+    det_m = all_detections[all_detections["competence"].str.contains("-", na=False)].copy()
 if not det_m.empty:
     con.register("det_m_view", det_m)
     agg = con.execute(f"""
@@ -806,12 +952,21 @@ if not det_m.empty:
         FROM det_m_view
         GROUP BY employee_id, competence
     """).fetchdf()
-    monthly["competence"] = monthly["year"].astype(str) + "-" + monthly["month"].astype(str).str.zfill(2)
-    monthly = monthly.merge(agg, on=["employee_id", "competence"], how="left", suffixes=("", "_new"))
-    for c in ["total_inconsistencies", "payment_inconsistencies", "night_shift_inconsistencies", "periculosidade_inconsistencies", "he_inconsistencies"]:
-        monthly[c] = monthly[f"{c}_new"].fillna(0).astype(int)
-        monthly.drop(columns=[f"{c}_new"], inplace=True)
-    monthly.to_parquet(f"{GOLD}/fact_monthly_employee.parquet", index=False, compression="zstd")
+    if PARTITIONED:
+        sub = monthly.loc[monthly_mask].merge(
+            agg, on=["employee_id", "competence"], how="left", suffixes=("", "_new"))
+        for c in COUNTER_COLS:
+            if f"{c}_new" in sub.columns:
+                sub[c] = sub[f"{c}_new"].fillna(0).astype(int)
+                sub.drop(columns=[f"{c}_new"], inplace=True)
+        monthly.loc[monthly_mask, COUNTER_COLS] = sub[COUNTER_COLS].to_numpy()
+    else:
+        monthly = monthly.merge(agg, on=["employee_id", "competence"], how="left", suffixes=("", "_new"))
+        for c in COUNTER_COLS:
+            monthly[c] = monthly[f"{c}_new"].fillna(0).astype(int)
+            monthly.drop(columns=[f"{c}_new"], inplace=True)
+    con.unregister("det_m_view")
+monthly.to_parquet(f"{GOLD}/fact_monthly_employee.parquet", index=False, compression="zstd")
 
 total_impact = all_detections["financial_impact"].sum()
 elapsed = time.time() - t_start
@@ -846,22 +1001,33 @@ manifest = {
     "full_coverage": True,
     "uc28_method": "interval-overlap of entry/exit shift spans; records without readable marks cannot be assessed (documented in rule detail)",
     "sla_rebaseline": "max_critical_rows 6000 -> 350000 (previous threshold matched LIMIT-truncated detection; runtime SLA 180s unchanged)",
+    "mode": "partitioned" if PARTITIONED else "full",
+    "competences_available": AVAILABLE_COMPETENCES,
+    "competences_processed": TARGETS if PARTITIONED else "all (full run)",
+    "detections_by_competence": {k: int(v) for k, v in sorted(norm_counts.items())},
+    "sla_policy": SLA_POLICY,
 }
+if merge_proof is not None:
+    manifest["merge"] = merge_proof
 with open(f"{GOLD}/validation_manifest.json", "w") as f:
     json.dump(manifest, f, indent=2)
 
 # Operational observability (history + SLA + alert)
 # max_critical_rows is re-baselined for full-coverage detection: the previous
 # 6000 threshold was calibrated when rules were LIMIT-truncated (baseline run
-# already reported 34k critical rows). Runtime SLA (180s) is unchanged.
+# already reported 34k critical rows). In partitioned mode the scoped rows and
+# a proportionally scaled SLA are recorded (see sla_policy in the manifest).
 obs_event = {
     "run_at": NOW_ISO,
     "pipeline": "validation_engine",
+    "mode": "partitioned" if PARTITIONED else "full",
+    "competences_processed": TARGETS if PARTITIONED else "all (full run)",
     "runtime_seconds": round(elapsed, 2),
-    "rows_detected": int(len(all_detections)),
-    "critical_rows": int((all_detections["severity"] == "critico").sum()),
+    "rows_detected": int(len(new_detections)),
+    "critical_rows": int((new_detections["severity"] == "critico").sum()),
+    "total_detections_in_output": int(len(all_detections)),
     "total_estimated_impact": float(round(total_impact, 2)),
-    "sla": {"max_runtime_seconds": 180, "max_critical_rows": 350000},
+    "sla": {"max_runtime_seconds": SLA_RUNTIME, "max_critical_rows": SLA_CRITICAL},
 }
 obs_event["sla_status"] = "PASS" if (obs_event["runtime_seconds"] <= obs_event["sla"]["max_runtime_seconds"] and obs_event["critical_rows"] <= obs_event["sla"]["max_critical_rows"]) else "FAIL"
 history_path = f"{OBS}/validation_history.json"
@@ -878,3 +1044,4 @@ if obs_event["sla_status"] == "FAIL":
 
 con.close()
 print(f"\nDone. Output: {path}")
+
